@@ -218,15 +218,20 @@ def computeFlops(df):
     df['L2_BW_PEAK'] = df['AI_L2_TOT'] * caches[arch]['L2']
     df['vL1d_BW_PEAK'] = df['AI_vL1d_TOT'] * caches[arch]['vL1d']
     df['LDS_BW_PEAK'] = df['AI_LDS_TOT'] * caches[arch]['LDS']
-    df['COMPUTE_PEAK'] = compute_peaks[arch]
+    df = pd.concat([df, pd.DataFrame({'COMPUTE_PEAK': [compute_peaks[arch]] * len(df)})], axis=1)
 
     # Determine performance peak/limiter
     df_peaks = df[['HBM_BW_PEAK','L2_BW_PEAK','vL1d_BW_PEAK','LDS_BW_PEAK','COMPUTE_PEAK']]
-    df['PEAK'] = df_peaks.where(df_peaks > 0).min(axis=1)
-    df['LIMITER'] = df_peaks.where(df_peaks > 0).idxmin(axis=1).str[:-5] + " (" + arch + ")"
+    peaks = df_peaks.where(df_peaks > 0).min(axis=1)
+    limiters = df_peaks.where(df_peaks > 0).idxmin(axis=1).str[:-5] + f" ({arch})"
+
+    df = pd.concat([df, pd.DataFrame({'PEAK': peaks, 'LIMITER': limiters})], axis=1)
 
 
-computeFlops(df_roof)  # Compute AI's for each kernel instance
+    return df
+
+
+df_roof = computeFlops(df_roof)  # Compute AI's for each kernel instance
 
 # Check for rocprofv3 and convert to v1 format
 if 'Agent_Id' in df_roof.columns:
@@ -235,7 +240,7 @@ if 'Agent_Id' in df_roof.columns:
     df_roof = df_roof.rename(columns={'Kernel_Name':'KernelName'})
 
 # Aggregate kernels
-df = df_roof.groupby('KernelName', sort=False).mean().reset_index()
+df = df_roof.groupby('KernelName', sort=False).mean(numeric_only=True).reset_index()
 
 
 # Get runtime stats
