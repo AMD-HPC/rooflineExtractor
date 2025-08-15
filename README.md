@@ -13,6 +13,12 @@ The following two runs of rocprof are needed to use rooflineExtractor:
   * This run gathers timing information for the application
   * `rocprof --stats <exe>` or `rocprofv3 --kernel-trace -- <exe>`
 
+## Install Python Packages
+Run this to install all necessary packages:
+```
+pip install -r requirements.txt
+```
+
 ## Run
 Simplest run:
 
