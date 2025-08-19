@@ -58,10 +58,15 @@ sigRuntime = args.sig_runtime
 # Load roof counters into pandas df
 df_roof = pd.read_csv(args.counter)
 
+
 # Check if empty
 if df_roof.empty:
   print('Input roof counters file is empty')
   quit() 
+# Check for wrong file
+if "CompleteNs" in df_roof.columns:
+    print('Error: "results.csv" log file submitted with "-c" flag, which is for "roof-counters.csv" log file')
+    quit()
 
 total_none_kernels = (df_roof == 'None').any(axis=1).sum()
 
@@ -69,10 +74,6 @@ total_none_kernels = (df_roof == 'None').any(axis=1).sum()
 if total_none_kernels > 0:
     print(f'{total_none_kernels} kernels had None values for some of the counters, which is a sign that runs of the application are non-deterministic. Removing these kernels and attempting to continue')
     df_roof = df_roof[~(df_roof == 'None').any(axis=1)]
-
-# Aggregate all instances of the kernel
-# Remove kernels with insignificant runtime
-#df = df[df['Percentage'] >= sigRuntime]
 
 
 # Function to convert columns with type mismatches to integers
