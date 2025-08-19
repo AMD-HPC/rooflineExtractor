@@ -68,12 +68,13 @@ if "CompleteNs" in df_roof.columns:
     print('Error: "results.csv" log file submitted with "-c" flag, which is for "roof-counters.csv" log file')
     quit()
 
-total_none_kernels = (df_roof == 'None').any(axis=1).sum()
-
+# Check for 'None' values and remove them
+total_none_kernels = max(df_roof.isnull().any(axis=1).sum(), (df_roof == 'None').any(axis=1).sum())
 
 if total_none_kernels > 0:
     print(f'{total_none_kernels} kernels had None values for some of the counters, which is a sign that runs of the application are non-deterministic. Removing these kernels and attempting to continue')
     df_roof = df_roof[~(df_roof == 'None').any(axis=1)]
+    df_roof = df_roof[~(df_roof.isnull()).any(axis=1)]
 
 
 # Function to convert columns with type mismatches to integers
