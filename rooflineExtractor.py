@@ -545,41 +545,42 @@ if args.plot:
     y_min = 0.5
     y_max = 200000
 
-
     x_vals = np.logspace(np.log10(x_min), np.log10(x_max), 200)
 
-    # Calculate roofline
-    y_vals_250 = [np.minimum(caches['MI250'][key] * x_vals, compute_peaks['MI250']) for key in caches['MI250'].keys()]
-    y_vals_300a = [np.minimum(caches['MI300A'][key] * x_vals, compute_peaks['MI300A']) for key in caches['MI300A'].keys()]
-    y_vals_300x = [np.minimum(caches['MI300x'][key] * x_vals, compute_peaks['MI300x']) for key in caches['MI300x'].keys()]
-
     # MI250 Roofline
-    mi250x_lines = [go.Scatter(
-        x=x_vals,
-        y=line,
-        visible=False,
-        mode='lines',
-        name='MI250X Achievable Peak',
-        line=dict(color='green', dash='solid')
-    ) for line in y_vals_250]
+    mi250x_lines = [
+        go.Scatter(
+            x=x_vals,
+            y=np.minimum(caches['MI250'][key] * x_vals, compute_peaks['MI250']),
+            visible=True,
+            mode='lines',
+            name=f'MI250X Achievable Peak - {key}',
+            line=dict(color=color_map[0], dash='solid')
+        )
+        for key in caches['MI250'].keys()
+    ]
     # MI300a Roofline
     mi300a_lines = [go.Scatter(
-        x=x_vals,
-        y=line,
-        visible=False,
-        mode='lines',
-        name='MI300A Achievable Peak',
-        line=dict(color='red', dash='solid')
-    ) for line in y_vals_300a]
+            x=x_vals,
+            y=np.minimum(caches['MI300A'][key] * x_vals, compute_peaks['MI300A']),
+            visible=True,
+            mode='lines',
+            name=f'MI300A Achievable Peak - {key}',
+            line=dict(color=color_map[0], dash='solid')
+        )
+        for key in caches['MI300A'].keys()
+    ]
     # MI300x Roofline
     mi300x_lines = [go.Scatter(
-        x=x_vals,
-        y=line,
-        visible=False,
-        mode='lines',
-        name='MI300x Achievable Peak',
-        line=dict(color='purple', dash='solid')
-    ) for line in y_vals_300x]
+            x=x_vals,
+            y=np.minimum(caches['MI300x'][key] * x_vals, compute_peaks['MI300x']),
+            visible=True,
+            mode='lines',
+            name=f'MI300x Achievable Peak - {key}',
+            line=dict(color=color_map[1], dash='solid')
+        )
+        for key in caches['MI300x'].keys()
+    ]
 
     # Truncate long kernel names (looking at you, rocblas)
     df_plot['short_name'] = np.where(
@@ -653,9 +654,10 @@ if args.plot:
     # Set HBM as default visibility
     for scatter in scatter_hbm:
         scatter.visible = True
+    for roofline in rooflines:
+        roofline.line.width = 1
     for roofline in rooflines[::4]:
-        roofline.visible = True
-
+        roofline.line.width = 3
 
     # Create slider steps based on percentage runtime thresholds
     thresholds = df_plot.groupby('KernelName')['PercentageAggregate'].first().tolist()
@@ -669,9 +671,7 @@ if args.plot:
         steps = []
         for threshold in thresholds:
             # Make the roofline for the respective cache visible, all others invisible
-            visible = [False] * c
-            visible = visible + [True]
-            visible = visible + [False] * (3 - c)
+            visible = [True] * 4
             visible = visible * int(len(rooflines)/4)
 
             # Filter the scatter plots for the correct cache
@@ -745,16 +745,25 @@ if args.plot:
                 y=1.1,
                 yanchor="top"
             ),
-            # Add dark mode toggle
+            # Add memory hierarchy toggle
             dict(
                 type="buttons",
                 direction="down",
                 buttons=list([
                     dict(label="HBM",
                         method="update",
-                        args=[{
-                                "visible": [True, False, False, False] * int(len(rooflines) / 4) +
-                                            [True] * len(scatter_hbm) + [False] * len(scatter_hbm) * 3
+                        args=[
+                            {
+                                "line": [
+                                    {"width": 3 if j == 0 else 1, "color": color_map[i]}
+                                    for i in range(int(len(rooflines) / 4))
+                                    for j in range(4)
+                                ],
+                                "visible": (
+                                    [True] * len(rooflines) +
+                                    [True] * len(scatter_hbm) +
+                                    [False] * len(scatter_hbm) * 3
+                                ),
                             }, {
                                 "sliders": [sliders[0]]
                             }
@@ -762,8 +771,17 @@ if args.plot:
                     dict(label="L2",
                         method="update",
                         args=[{
-                                "visible": [False, True, False, False] * int(len(rooflines) / 4) +
-                                            [False] * len(scatter_l2) + [True] * len(scatter_l2) + [False] * len(scatter_l2) * 2
+                                "line": [
+                                    {"width": 3 if j == 1 else 1, "color": color_map[i]}
+                                    for i in range(int(len(rooflines) / 4))
+                                    for j in range(4)
+                                ],
+                                "visible": (
+                                    [True] * len(rooflines) +
+                                    [False] * len(scatter_l2) +
+                                    [True] * len(scatter_l2) +
+                                    [False] * len(scatter_l2) * 2
+                                ),
                             }, {
                                 "sliders": [sliders[1]]
                             }
@@ -771,8 +789,17 @@ if args.plot:
                     dict(label="vL1d",
                         method="update",
                         args=[{
-                                "visible": [False, False, True, False] * int(len(rooflines) / 4) +
-                                            [False] * len(scatter_l1) * 2 + [True] * len(scatter_l1) + [False] * len(scatter_l1)
+                                "line": [
+                                    {"width": 3 if j == 2 else 1, "color": color_map[i]}
+                                    for i in range(int(len(rooflines) / 4))
+                                    for j in range(4)
+                                ],
+                                "visible": (
+                                    [True] * len(rooflines) +
+                                    [False] * len(scatter_l1) * 2 +
+                                    [True] * len(scatter_l1) +
+                                    [False] * len(scatter_l1)
+                                ),
                             }, {
                                 "sliders": [sliders[2]]
                             }
@@ -780,8 +807,16 @@ if args.plot:
                     dict(label="LDS",
                         method="update",
                         args=[{
-                                "visible": [False, False, False, True] * int(len(rooflines) / 4) +
-                                            [False] * len(scatter_lds) * 3 + [True] * len(scatter_lds)
+                                "line": [
+                                    {"width": 3 if j == 3 else 1, "color": color_map[i]}
+                                    for i in range(int(len(rooflines) / 4))
+                                    for j in range(4)
+                                ],
+                                "visible": (
+                                    [True] * len(rooflines) +
+                                    [False] * len(scatter_lds) * 3 +
+                                    [True] * len(scatter_lds)
+                                ),
                             }, {
                                 "sliders": [sliders[3]]
                             }
