@@ -235,7 +235,7 @@ def computeFlops(df):
     return df
 
 
-df_roof = computeFlops(df_roof)  # Compute AI's for each kernel instance
+df_roof = computeFlops(df_roof)  # Compute AI's for each kernel dispatch
 
 # Check for rocprofv3 and convert to v1 format
 if 'Agent_Id' in df_roof.columns:
@@ -443,15 +443,15 @@ df['PercentAchieved'] = df['Throughput'] / df['PEAK'] * 100
 
 # Guided analysis
 print(f"Total unique kernels: {len(df)}")
-print(f"Total kernel instances: {len(df_roof)}")
+print(f"Total kernel dispatches: {len(df_roof)}")
 for index, row in df.iterrows():  # loop through each kernel 
     if row['Percentage'] < sigRuntime:
         continue
     print("\n" + index)
-    print(f"  Total operations per instance:", "{:e}".format(row['TOTAL_OPS']), "ops")
-    print(f"  Average runtime per instance: ", "{:e}".format(row['AverageNs']), "ns")
+    print(f"  Total operations per dispatch:", "{:e}".format(row['TOTAL_OPS']), "ops")
+    print(f"  Average runtime per dispatch: ", "{:e}".format(row['AverageNs']), "ns")
     print(f"  Total contribution to runtime: {round(row['Percentage'], 3)} %")
-    print(f"  Total instances:               {int(row['Count'])}")
+    print(f"  Total dispatches:              {int(row['Count'])}")
 
     print(f"\n  Arithmetic intensity (HBM):  ", round(row['AI_HBM_TOT'], 4))
     print(f"  Arithmetic intensity (L2):   ", round(row['AI_L2_TOT'], 4))
@@ -528,16 +528,24 @@ df_roof = df_roof.rename(columns={'Percentage_y':'PercentageAggregate'})
 # Interactive roofline plot
 if args.plot:
     df_plot = df_roof
-    # Sort the data by significance
     df_plot['TotalKernels'] = len(df_plot)  # Saving in this format to pass to tooltip
-    df_plot = df_plot.sort_values(by='Percentage', ascending=False)
-    df_plot = df_plot.head(50000)  # Only use the 50000 kernels that contribute most to runtime
+
+    # Maximum number of kernel dispatches to plot (browser slows down with more)
+    n_samples = 50000
+
+    if len(df_plot) > n_samples:
+        df_plot.sort_values('Index')
+        df_plot = df_plot.iloc[::len(df_plot) // n_samples]
+        n_samples = len(df_plot)  # Adjust for remainder
+
+    # Sort the data by significance
     df_plot = df_plot.sort_values(by='PercentageAggregate', ascending=False)
 
     # Assign a unique color to each name
     color_map = px.colors.qualitative.Plotly
-    name_to_color = {name: color_map[i % len(color_map)] for i, name in enumerate(df_plot['KernelName'].unique())}
+    name_to_color = {name: color_map[i % len(color_map)] for i, name in enumerate(df.index)}
     df_plot['color'] = [name_to_color[name] for name in df_plot['KernelName']]
+    df['color'] = [name_to_color[name] for name in df.index]
 
     # Compute the range for the plot
     x_min = 0.001
@@ -583,14 +591,17 @@ if args.plot:
     ]
 
     # Truncate long kernel names (looking at you, rocblas)
+    df['short_name'] = np.where(
+        df.index.str.len() > 50,
+        df.index.str.slice(0, 47) + '…',  # 47 + 1 char ellipsis = 48 visible chars
+        df.index
+    )
+    # Truncate long kernel names (looking at you, rocblas)
     df_plot['short_name'] = np.where(
         df_plot['KernelName'].str.len() > 50,
         df_plot['KernelName'].str.slice(0, 47) + '…',  # 47 + 1 char ellipsis = 48 visible chars
         df_plot['KernelName']
     )
-
-    # Pass name, percent for tooltip
-    customdata = np.stack([df_plot['short_name'], df_plot['Percentage'], df_plot['Index'], df_plot['TotalKernels'], df_plot['PercentageAggregate'], df_plot['PEAK'], df_plot['LIMITER']], axis=-1)
 
     # Layout with log-log axes and slider
     layout = go.Layout(
@@ -640,10 +651,45 @@ if args.plot:
 
         return scatter_items
 
+    def interactive_plot_agg(cache):
+
+        # Add scatter plot
+        scatter_items = []
+        for index, kernel in df.iterrows():
+            short_name = kernel['short_name']
+            short_name += f'\t{round(kernel["Percentage"], 3)}% runtime'
+            # Pass name, percent for tooltip
+            customdata=np.stack([[kernel['short_name']], [kernel['Percentage']], [kernel['PEAK']], [kernel['LIMITER']], [kernel['Count']]], axis=-1)
+            scatter_items.append(go.Scatter(
+                x=[kernel[f'AI_{cache}_TOT']],
+                y=[kernel['Throughput']],
+                mode='markers',
+                name=short_name,
+                marker=dict(color=kernel['color']),
+                visible=False,
+                customdata = customdata,
+                hovertemplate=
+                    'Name: %{customdata[0]}<br>' +
+                    'AI: %{x}<br>' +
+                    'Achieved throughput: %{y:.3f} GFLOPs/s<br>' +
+                    'Peak throughput: %{customdata[2]:.3f} GFLOPs/s<br>' +
+                    'Performance limiter: %{customdata[3]}<br>' +
+                    'Total dispatches: %{customdata[4]}<br>' +
+                    'Aggregate percent runtime: %{customdata[1]:.5f} %<br>' +
+                    '<extra></extra>'
+            ))
+
+        return scatter_items
+
     scatter_hbm = interactive_plot('HBM')
     scatter_l2 = interactive_plot('L2')
     scatter_l1 = interactive_plot('vL1d')
     scatter_lds = interactive_plot('LDS')
+    scatter_hbm_agg = interactive_plot_agg('HBM')
+    scatter_l2_agg = interactive_plot_agg('L2')
+    scatter_l1_agg = interactive_plot_agg('vL1d')
+    scatter_lds_agg = interactive_plot_agg('LDS')
+
 
     # Check for MI200/300
     if df_plot.keys().str.contains('TCC_BUBBLE').sum() > 0:
@@ -651,8 +697,8 @@ if args.plot:
     else:
         rooflines = mi250x_lines
 
-    # Set HBM as default visibility
-    for scatter in scatter_hbm:
+    # Set HBM aggregate as default visibility
+    for scatter in scatter_hbm_agg:
         scatter.visible = True
     for roofline in rooflines:
         roofline.line.width = 1
@@ -660,17 +706,18 @@ if args.plot:
         roofline.line.width = 3
 
     # Create slider steps based on percentage runtime thresholds
-    thresholds = df_plot.groupby('KernelName')['PercentageAggregate'].first().tolist()
+    thresholds = df['Percentage'].tolist()
     # Set max number of thresholds at 40, also include 0
     thresholds.sort()
     thresholds = [0] + thresholds[-40:]
 
     # Create separate slider for each cache level
     sliders = []
+    # Individual kernel dispatches
     for c in range(4):
         steps = []
         for threshold in thresholds:
-            # Make the roofline for the respective cache visible, all others invisible
+            # Make the rooflines visible
             visible = [True] * 4
             visible = visible * int(len(rooflines)/4)
 
@@ -678,6 +725,33 @@ if args.plot:
             visible = visible + [False] * (c * len(df_plot.groupby('KernelName')))
             visible = visible + (pd.Series(df_plot.groupby('KernelName')['PercentageAggregate'].first().tolist()).sort_values() >= threshold).tolist()[::-1]
             visible = visible + [False] * ((3 - c) * len(df_plot.groupby('KernelName')))
+            # Aggregates
+            visible = visible + [False] * (4 * len(df))
+            steps.append(dict(
+                method="update",
+                args=[{"visible": visible}],
+                label=f"{threshold:.3f}%"
+            ))
+        sliders.append(dict(
+            active=0,
+            currentvalue={"prefix": "Minimum Percent Runtime: "},
+            pad={"t": 50},
+            steps=steps
+        ))
+    # Aggregate kernel dispatches
+    for c in range(4):
+        steps = []
+        for threshold in thresholds:
+            # Make the rooflines visible
+            visible = [True] * 4
+            visible = visible * int(len(rooflines)/4)
+
+            # Filter the scatter plots for the correct cache
+            visible = visible + [False] * (4 * len(df_plot.groupby('KernelName')))
+            # Aggregates
+            visible = visible + [False] * (c * len(df))
+            visible = visible + (pd.Series(df['Percentage'].tolist()).sort_values() >= threshold).tolist()[::-1]
+            visible = visible + [False] * ((3 - c) * len(df))
             steps.append(dict(
                 method="update",
                 args=[{"visible": visible}],
@@ -690,10 +764,23 @@ if args.plot:
             steps=steps
         ))
 
+    # Add disclaimer if kernel dispatches need to be filtered
+    disclaimer = None
+    if df_plot.iloc[0]['TotalKernels'] > n_samples:
+        disclaimer = dict(
+            text=f"Depicting {n_samples} kernel dispatches out of {df_plot.iloc[0]['TotalKernels']}",
+            xref="paper", yref="paper",
+            x=1, y=0.05,
+            showarrow=False,
+            font=dict(size=12),
+            xanchor='left',
+            yanchor='top'
+        )
+
     # Combine scatters and rooflines
-    fig = go.Figure(data=rooflines + scatter_hbm + scatter_l2 + scatter_l1 + scatter_lds, layout=layout)
+    fig = go.Figure(data=rooflines + scatter_hbm + scatter_l2 + scatter_l1 + scatter_lds + scatter_hbm_agg + scatter_l2_agg + scatter_l1_agg + scatter_lds_agg, layout=layout)
     fig.update_layout(
-        sliders=[sliders[0]],
+        sliders=[sliders[4]],
         plot_bgcolor="white",
         xaxis=dict(
             gridcolor="lightgray",
@@ -750,6 +837,26 @@ if args.plot:
                 type="buttons",
                 direction="down",
                 buttons=list([
+                    dict(label="HBM Agg",
+                        method="update",
+                        args=[
+                            {
+                                "line": [
+                                    {"width": 3 if j == 0 else 1, "color": color_map[i]}
+                                    for i in range(int(len(rooflines) / 4))
+                                    for j in range(4)
+                                ],
+                                "visible": (
+                                    [True] * len(rooflines) +
+                                    [False] * len(scatter_hbm) * 4 +
+                                    [True] * len(scatter_hbm_agg) +
+                                    [False] * len(scatter_hbm_agg) * 3
+                                ),
+                            }, {
+                                "sliders": [sliders[4]],
+                                "annotations": [None]
+                            }
+                        ]),
                     dict(label="HBM",
                         method="update",
                         args=[
@@ -762,10 +869,32 @@ if args.plot:
                                 "visible": (
                                     [True] * len(rooflines) +
                                     [True] * len(scatter_hbm) +
-                                    [False] * len(scatter_hbm) * 3
+                                    [False] * len(scatter_hbm) * 3 +
+                                    [False] * len(scatter_hbm_agg) * 4
                                 ),
                             }, {
-                                "sliders": [sliders[0]]
+                                "sliders": [sliders[0]],
+                                "annotations": [disclaimer]
+                            }
+                        ]),
+                    dict(label="L2 Agg",
+                        method="update",
+                        args=[{
+                                "line": [
+                                    {"width": 3 if j == 1 else 1, "color": color_map[i]}
+                                    for i in range(int(len(rooflines) / 4))
+                                    for j in range(4)
+                                ],
+                                "visible": (
+                                    [True] * len(rooflines) +
+                                    [False] * len(scatter_l2) * 4 +
+                                    [False] * len(scatter_l2_agg) +
+                                    [True] * len(scatter_l2_agg) +
+                                    [False] * len(scatter_l2_agg) * 2
+                                ),
+                            }, {
+                                "sliders": [sliders[5]],
+                                "annotations": [None]
                             }
                         ]),
                     dict(label="L2",
@@ -780,10 +909,32 @@ if args.plot:
                                     [True] * len(rooflines) +
                                     [False] * len(scatter_l2) +
                                     [True] * len(scatter_l2) +
-                                    [False] * len(scatter_l2) * 2
+                                    [False] * len(scatter_l2) * 2 +
+                                    [False] * len(scatter_l2_agg) * 4
                                 ),
                             }, {
-                                "sliders": [sliders[1]]
+                                "sliders": [sliders[1]],
+                                "annotations": [disclaimer]
+                            }
+                        ]),
+                    dict(label="vL1d Agg",
+                        method="update",
+                        args=[{
+                                "line": [
+                                    {"width": 3 if j == 2 else 1, "color": color_map[i]}
+                                    for i in range(int(len(rooflines) / 4))
+                                    for j in range(4)
+                                ],
+                                "visible": (
+                                    [True] * len(rooflines) +
+                                    [False] * len(scatter_l1) * 4 +
+                                    [False] * len(scatter_l1_agg) * 2 +
+                                    [True] * len(scatter_l1_agg) +
+                                    [False] * len(scatter_l1_agg)
+                                ),
+                            }, {
+                                "sliders": [sliders[6]],
+                                "annotations": [None]
                             }
                         ]),
                     dict(label="vL1d",
@@ -798,10 +949,31 @@ if args.plot:
                                     [True] * len(rooflines) +
                                     [False] * len(scatter_l1) * 2 +
                                     [True] * len(scatter_l1) +
-                                    [False] * len(scatter_l1)
+                                    [False] * len(scatter_l1) +
+                                    [False] * len(scatter_l1_agg) * 4
                                 ),
                             }, {
-                                "sliders": [sliders[2]]
+                                "sliders": [sliders[2]],
+                                "annotations": [disclaimer]
+                            }
+                        ]),
+                    dict(label="LDS Agg",
+                        method="update",
+                        args=[{
+                                "line": [
+                                    {"width": 3 if j == 3 else 1, "color": color_map[i]}
+                                    for i in range(int(len(rooflines) / 4))
+                                    for j in range(4)
+                                ],
+                                "visible": (
+                                    [True] * len(rooflines) +
+                                    [False] * len(scatter_lds) * 4 +
+                                    [False] * len(scatter_lds_agg) * 3 +
+                                    [True] * len(scatter_lds_agg)
+                                ),
+                            }, {
+                                "sliders": [sliders[7]],
+                                "annotations": [None]
                             }
                         ]),
                     dict(label="LDS",
@@ -815,10 +987,12 @@ if args.plot:
                                 "visible": (
                                     [True] * len(rooflines) +
                                     [False] * len(scatter_lds) * 3 +
-                                    [True] * len(scatter_lds)
+                                    [True] * len(scatter_lds) +
+                                    [False] * len(scatter_lds_agg) * 4
                                 ),
                             }, {
-                                "sliders": [sliders[3]]
+                                "sliders": [sliders[3]],
+                                "annotations": [disclaimer]
                             }
                         ]),
                 ]),
@@ -827,21 +1001,6 @@ if args.plot:
 
         ]
     )
-    if df_plot.iloc[0]['TotalKernels'] > 50000:
-        fig.update_layout(
-            margin=dict(b=60),
-            annotations=[
-                dict(
-                    text=f"Depicting the 50000 kernels out of {df_plot.iloc[0]['TotalKernels']} with the greatest individual runtime",
-                    xref="paper", yref="paper",
-                    x=1, y=0.05,
-                    showarrow=False,
-                    font=dict(size=12),
-                    xanchor='left',
-                    yanchor='top'
-                )
-            ]
-        )
 
     fig.write_html(f'{roofCountFilename}.html')
     print(f"Roofline plot saved to                  {roofCountFilename}.html")
