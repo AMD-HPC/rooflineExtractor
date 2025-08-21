@@ -553,7 +553,10 @@ if args.plot:
     y_min = 0.5
     y_max = 200000
 
+    # Get x-values for lines
     x_vals = np.logspace(np.log10(x_min), np.log10(x_max), 200)
+    # Add a point for each spot a bandwidth line intersects the compute line
+    x_vals = np.sort(np.append(x_vals, [compute_peaks[arch] / caches[arch][cache] for cache in caches[arch] for arch in caches]))
 
     # MI250 Roofline
     mi250x_lines = [
@@ -562,7 +565,7 @@ if args.plot:
             y=np.minimum(caches['MI250'][key] * x_vals, compute_peaks['MI250']),
             visible=True,
             mode='lines',
-            name=f'MI250X Achievable Peak - {key}',
+            name=f'MI250X {key} Achievable Peak',
             line=dict(color=color_map[0], dash='solid')
         )
         for key in caches['MI250'].keys()
@@ -573,7 +576,7 @@ if args.plot:
             y=np.minimum(caches['MI300A'][key] * x_vals, compute_peaks['MI300A']),
             visible=True,
             mode='lines',
-            name=f'MI300A Achievable Peak - {key}',
+            name=f'MI300A {key} Achievable Peak',
             line=dict(color=color_map[0], dash='solid')
         )
         for key in caches['MI300A'].keys()
@@ -584,7 +587,7 @@ if args.plot:
             y=np.minimum(caches['MI300x'][key] * x_vals, compute_peaks['MI300x']),
             visible=True,
             mode='lines',
-            name=f'MI300x Achievable Peak - {key}',
+            name=f'MI300x {key} Achievable Peak',
             line=dict(color=color_map[1], dash='solid')
         )
         for key in caches['MI300x'].keys()
