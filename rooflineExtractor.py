@@ -1,87 +1,47 @@
 import pandas as pd
-from tabulate import tabulate
 import numpy as np
-import abc
-import time
 import pdb
-import sys
+import shutil
 import argparse
-import plotly.graph_objs as go
-import plotly.express as px
-from plotly.subplots import make_subplots
+import json
+import requests
 
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-import matplotlib.ticker as mtick
-from matplotlib.lines import Line2D
-from matplotlib.patches import Patch
+_config_dir = Path(__file__).parent / "config"
 
-from scipy.stats import gmean
-
-plt.rcParams.update({'font.size': 12})
+# Qualitative palette (matches Plotly default used previously for kernel colors)
+_QUAL_COLORS = [
+    "#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3", "#FF6692", "#B6E880",
+    "#FF97FF", "#FECB52",
+]
 
 sigRuntime = 10  # Default value, can be changed from command line
-numCUs = 228  # total compute units on MI300A
-peakBandwidth = 3700  # peak bandwidth estimate
 
-# Get filenames from input args
-parser = argparse.ArgumentParser()
-parser.add_argument('-c', '--counter', required=True, help='Provide roof_counters.csv filename from rocprof -i')
-parser.add_argument('-r', '--results', required=True, help='Provide results.csv filename from rocprof --stats')
-parser.add_argument('-m', '--hw-metrics', help='Provide hw_metrics.csv filename from rocSTAR')
-parser.add_argument('--sig-runtime', required=False, default=10, type=float, help='Provide the percentage of runtime considered "significant" for analysis (kernels under that percentage will be omitted)')
-parser.add_argument('-p', '--plot', action='store_true', required=False, help='Generate plots')
-parser.add_argument('-d', '--dump', action='store_true', required=False, help='Dump DataFrame to csv')
-
-args = parser.parse_args()
-
-
-
-
-roofCountFilename = ""
-statFlename = ""
-runtimeFilename = ""
-hwFilename = ""
-
-
-last_dot_index = args.counter.rfind('.')
-roofCountFilename = args.counter[:last_dot_index] # everything before .csv
-last_dot_index = args.results.rfind('.')
-runtimeFilename = args.results.rfind('.')  # everything before .csv
-if args.hw_metrics != None:
-    last_dot_index = args.hw_metrics.rfind('.')
-    hwFilename = args.hw_metrics[:last_dot_index]  # everything before .csv
-
-sigRuntime = args.sig_runtime
-
-# Load roof counters into pandas df
-df_roof = pd.read_csv(args.counter)
-
-
-# Check if empty
-if df_roof.empty:
-  print('Input roof counters file is empty')
-  quit() 
-# Check for wrong file
-if "CompleteNs" in df_roof.columns:
-    print('Error: "results.csv" log file submitted with "-c" flag, which is for "roof-counters.csv" log file')
-    quit()
-
-# Check for 'None' values and remove them
-total_none_kernels = max(df_roof.isnull().any(axis=1).sum(), (df_roof == 'None').any(axis=1).sum())
-
-if total_none_kernels > 0:
-    print(f'{total_none_kernels} kernels had None values for some of the counters, which is a sign that runs of the application are non-deterministic. Removing these kernels and attempting to continue')
-    df_roof = df_roof[~(df_roof == 'None').any(axis=1)]
-    df_roof = df_roof[~(df_roof.isnull()).any(axis=1)]
+# Bandwidths — loaded from config/cache_bandwidths.csv relative to this script's location
+_caches_path = _config_dir / "cache_bandwidths.csv"
+_caches_df = pd.read_csv(_caches_path, index_col="Architecture")
+caches = _caches_df.to_dict(orient="index")
 
 
 # Function to convert columns with type mismatches to integers
 def convert_columns_to_int(df):
     counters = ['SQ_INSTS_VALU_ADD_F16', 'SQ_INSTS_VALU_MUL_F16',       'SQ_INSTS_VALU_FMA_F16', 'SQ_INSTS_VALU_TRANS_F16',       'SQ_INSTS_VALU_ADD_F32', 'SQ_INSTS_VALU_MUL_F32',       'SQ_INSTS_VALU_FMA_F32', 'SQ_INSTS_VALU_TRANS_F32',       'SQ_INSTS_VALU_ADD_F64', 'SQ_INSTS_VALU_MUL_F64',       'SQ_INSTS_VALU_FMA_F64', 'SQ_INSTS_VALU_TRANS_F64',       'SQ_INSTS_VALU_MFMA_MOPS_F16', 'SQ_INSTS_VALU_MFMA_MOPS_BF16',       'SQ_INSTS_VALU_MFMA_MOPS_F32', 'SQ_INSTS_VALU_MFMA_MOPS_F64', 'SQ_LDS_IDX_ACTIVE', 'SQ_LDS_BANK_CONFLICT',       'TCP_TCC_READ_REQ_sum', 'TCP_TCC_WRITE_REQ_sum',       'TCP_TCC_ATOMIC_WITH_RET_REQ_sum', 'TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum',       'TCP_TOTAL_CACHE_ACCESSES_sum', 'SQ_INSTS_VALU_INT32',       'SQ_INSTS_VALU_INT64', 'SQ_INSTS_VALU_CVT', 'SQ_INSTS_SALU']
+
+    # Checks for counters that were added in later versions of rooflineExtractor (to stay compatible with earlier counter files)
+    if 'TCC_REQ_sum' in df.columns:
+        counters.append('TCC_REQ_sum')
+    if 'SQ_INSTS_VMEM_WR' in df.columns:
+        counters.append('SQ_INSTS_VMEM_WR')
+    if 'SQ_INSTS_VMEM_RD' in df.columns:
+        counters.append('SQ_INSTS_VMEM_RD')
     if 'SQ_INSTS_VALU' in df.columns:
         counters.append('SQ_INSTS_VALU')
+    if 'SQ_INSTS_VALU_MFMA_MOPS_I8' in df.columns:
+        counters.append('SQ_INSTS_VALU_MFMA_MOPS_I8')
+    if 'SQ_INSTS_VALU_MFMA_MOPS_F8' in df.columns:
+        counters.append('SQ_INSTS_VALU_MFMA_MOPS_F8')
+    # Check for CDNA2 vs. CDNA3-4 counters
     if 'TCC_BUBBLE_sum' in df.columns:
         counters.append('TCC_BUBBLE_sum')
         counters.append('TCC_EA0_RDREQ_sum')
@@ -93,929 +53,2419 @@ def convert_columns_to_int(df):
         counters.append('TCC_EA_RDREQ_32B_sum')
         counters.append('TCC_EA_WRREQ_sum')
         counters.append('TCC_EA_WRREQ_64B_sum')
+    for c in (
+        'TCC_EA0_WRREQ_WRITE_DRAM_32B_sum',
+        'TCC_EA0_RDREQ_DRAM_32B_sum',
+        'TCC_EA0_WRREQ_ATOMIC_DRAM_32B_sum',
+    ):
+        if c in df.columns:
+            counters.append(c)
 
     for counter in counters:
         df[counter] = pd.to_numeric(df[counter], errors='coerce').astype(int)
     return df
-df_roof = convert_columns_to_int(df_roof)
 
-# Bandwidths (MI250, MI300A, MI300x)
-caches = {
-    "MI250":  {"HBM": 1340,  "L2": 5019,  "vL1d": 9217,  "LDS": 20816},
-    "MI300A": {"HBM": 3688,  "L2": 20343, "vL1d": 26092, "LDS": 57574},
-    "MI300x": {"HBM": 4224,  "L2": 26655, "vL1d": 34191, "LDS": 75657},
-}
 
-# Roofline numbers (peak bandwidth, peak compute)
-compute_peaks = {
-    "MI250":  36111,
-    "MI300A": 78716,
-    "MI300x": 94602,
-}
+def load_from_directory(dir_path):
+    """Load counters.csv and trace_kernel_trace.csv from each immediate subdirectory.
+
+    Each subdirectory with both files is treated as one application; rows are tagged
+    with an Application column (subdirectory name) for correct counter–trace pairing.
+
+    Returns (df_roof, df_runtime, base_name) for use with extract(..., base_name=...).
+    """
+    root = Path(dir_path).resolve()
+    if not root.is_dir():
+        print(f"Error: not a directory: {dir_path}")
+        quit()
+    roof_parts = []
+    runtime_parts = []
+    for sub in sorted(root.iterdir()):
+        if not sub.is_dir():
+            continue
+        c = sub / "counters.csv"
+        t = sub / "trace_kernel_trace.csv"
+        if not c.is_file() or not t.is_file():
+            print(f"Skipping {sub.name}: missing counters.csv or trace_kernel_trace.csv")
+            continue
+        dfr = pd.read_csv(c)
+        dft = pd.read_csv(t)
+        dfr["Application"] = sub.name
+        dft["Application"] = sub.name
+        roof_parts.append(dfr)
+        runtime_parts.append(dft)
+    if not roof_parts:
+        print(
+            "Error: no subdirectory contains both counters.csv and trace_kernel_trace.csv"
+        )
+        quit()
+    return (
+        pd.concat(roof_parts, ignore_index=True),
+        pd.concat(runtime_parts, ignore_index=True),
+        root.name,
+    )
+
+
+def _safe_divide(numerator, denominator):
+    """Divide two Series, replacing inf and NaN with 0."""
+    return numerator.divide(denominator).replace(np.inf, 0).replace(np.nan, 0)
+
+
+def _format_byte_size(n):
+    """Format a byte count using B, KB, MB, or GB (1024-based); TB if needed."""
+    x = float(pd.to_numeric(n, errors="coerce"))
+    if np.isnan(x):
+        return "nan"
+    if np.isinf(x):
+        return "inf" if x > 0 else "-inf"
+    abs_x = abs(x)
+    sign = -1.0 if x < 0 else 1.0
+    units = ("B", "KB", "MB", "GB", "TB")
+    u = 0
+    v = abs_x
+    while v >= 1024.0 and u < len(units) - 1:
+        v /= 1024.0
+        u += 1
+    v *= sign
+    if u == 0:
+        if float(int(v)) == v:
+            return f"{int(v)} B"
+        return f"{v:.3f} B"
+    return f"{v:.3f} {units[u]}"
+
+
+def _compute_ai_columns(df, mem_level):
+    """Compute arithmetic intensity columns for one memory hierarchy level."""
+    bw = df[f'BW_{mem_level}']
+    cols = {}
+    for suffix, total_col in [
+        ('TOT', 'TOTAL_OPS'), ('SALU', 'TOTAL_SALU'),
+        ('VALU_F16', 'TOTAL_VALU_F16'), ('VALU_F32', 'TOTAL_VALU_F32'),
+        ('VALU_F64', 'TOTAL_VALU_F64'), ('VALU_I32', 'TOTAL_VALU_I32'),
+        ('VALU_I64', 'TOTAL_VALU_I64'),
+    ]:
+        cols[f'AI_{mem_level}_{suffix}'] = _safe_divide(df[total_col], bw)
+    for guard_col, suffix, total_col in [
+        ('SQ_INSTS_VALU_MFMA_MOPS_F8', 'MOPS_F8', 'TOTAL_MOPS_F8'),
+        ('SQ_INSTS_VALU_MFMA_MOPS_I8', 'MOPS_I8', 'TOTAL_MOPS_I8'),
+    ]:
+        if guard_col in df.columns:
+            cols[f'AI_{mem_level}_{suffix}'] = _safe_divide(df[total_col], bw)
+    for suffix, total_col in [
+        ('MOPS_F16', 'TOTAL_MOPS_F16'), ('MOPS_BF16', 'TOTAL_MOPS_BF16'),
+        ('MOPS_F32', 'TOTAL_MOPS_F32'), ('MOPS_F64', 'TOTAL_MOPS_F64'),
+    ]:
+        cols[f'AI_{mem_level}_{suffix}'] = _safe_divide(df[total_col], bw)
+    return cols
+
+
+def _lookup_peak(df_bw, datatype, operation, arch_col):
+    """Look up a single peak value from the benchWarmer DataFrame."""
+    return df_bw.loc[
+        (df_bw['Datatype'] == datatype) & (df_bw['Operation'] == operation), arch_col
+    ].values[0]
+
+
+def _load_peaks(df_bw, arch_col, df):
+    """Load all peak throughput values for a given architecture from benchWarmer data."""
+    peaks = {}
+    for dtype in ['fp16', 'fp32', 'fp64']:
+        for op, key in [(' Add', 'add'), (' Mul', 'mul'), (' MulAdd', 'muladd'), (' Rsqrt', 'trans')]:
+            peaks[f'{dtype}_{key}'] = _lookup_peak(df_bw, dtype, op, arch_col)
+
+    if 'SQ_INSTS_VALU_MFMA_MOPS_F8' in df.columns:
+        peaks['fp8_mfma'] = _lookup_peak(df_bw, 'fp8', ' mfma', arch_col)
+    if 'SQ_INSTS_VALU_MFMA_MOPS_I8' in df.columns:
+        peaks['i8_mfma'] = _lookup_peak(df_bw, 'int8', ' mfma', arch_col)
+    peaks['fp16_mfma'] = _lookup_peak(df_bw, 'fp16', ' mfma', arch_col)
+    peaks['bf16_mfma'] = _lookup_peak(df_bw, 'bf16', ' mfma', arch_col)
+    peaks['fp32_mfma'] = _lookup_peak(df_bw, 'fp32', ' mfma', arch_col)
+    # Handle case where fp64 mfma is not present (MI100)
+    fp64_mfma_row = df_bw.loc[
+        (df_bw['Datatype'] == 'fp64') & (df_bw['Operation'] == ' mfma'), arch_col
+    ]
+    peaks['fp64_mfma'] = fp64_mfma_row.values[0] if not fp64_mfma_row.empty else 0
+
+    # INT32 Mul is the best performing test that hardware counters recognize as INT32
+    peaks['int32'] = _lookup_peak(df_bw, 'int32', ' Mul', arch_col)
+    # INT32 MulAdd is the best performing test that hardware counters recognize as INT64; divide by 2 for GInsts/s
+    peaks['int64'] = _lookup_peak(df_bw, 'int32', ' MulAdd', arch_col) / 2
+    # Assume 'other' operations are int8 left shifts (best performing operation without a dedicated counter)
+    peaks['other'] = _lookup_peak(df_bw, 'int8', ' ShiftLeft', arch_col)
+
+    return peaks
+
+
+def _compute_kernel_peak(df, peaks):
+    """Compute kernel-specific compute peak from instruction counts and peak throughputs."""
+    weighted_time = (
+        64 * df['SQ_INSTS_VALU_ADD_F16'] / peaks['fp16_add'] +
+        64 * df['SQ_INSTS_VALU_MUL_F16'] / peaks['fp16_mul'] +
+        64 * 2 * df['SQ_INSTS_VALU_FMA_F16'] / peaks['fp16_muladd'] +
+        64 * df['SQ_INSTS_VALU_TRANS_F16'] / peaks['fp16_trans'] +
+        64 * df['SQ_INSTS_VALU_ADD_F32'] / peaks['fp32_add'] +
+        64 * df['SQ_INSTS_VALU_MUL_F32'] / peaks['fp32_mul'] +
+        64 * 2 * df['SQ_INSTS_VALU_FMA_F32'] / peaks['fp32_muladd'] +
+        64 * df['SQ_INSTS_VALU_TRANS_F32'] / peaks['fp32_trans'] +
+        64 * df['SQ_INSTS_VALU_ADD_F64'] / peaks['fp64_add'] +
+        64 * df['SQ_INSTS_VALU_MUL_F64'] / peaks['fp64_mul'] +
+        64 * 2 * df['SQ_INSTS_VALU_FMA_F64'] / peaks['fp64_muladd'] +
+        64 * df['SQ_INSTS_VALU_TRANS_F64'] / peaks['fp64_trans'] +
+        64 * df['SQ_INSTS_VALU_INT32'] / peaks['int32'] +
+        64 * df['SQ_INSTS_VALU_INT64'] / peaks['int64'] +
+        df['TOTAL_MOPS_F16'] / peaks['fp16_mfma'] +
+        df['TOTAL_MOPS_BF16'] / peaks['bf16_mfma'] +
+        df['TOTAL_MOPS_F32'] / peaks['fp32_mfma'] +
+        df['TOTAL_MOPS_F64'] / peaks['fp64_mfma']
+    )
+
+    if 'TOTAL_VALU_OTHER' in df.columns:
+        weighted_time += df['TOTAL_VALU_OTHER'] / peaks['other']
+    if 'fp8_mfma' in peaks:
+        weighted_time += df['TOTAL_MOPS_F8'] / peaks['fp8_mfma']
+    if 'i8_mfma' in peaks:
+        weighted_time += df['TOTAL_MOPS_I8'] / peaks['i8_mfma']
+
+    return ((df['TOTAL_OPS'] - df['TOTAL_SALU']) / weighted_time).replace(np.inf, 0)
+
+
+_JKL_ALPHA_BY_LABEL_CACHE = {}
+
+
+def _hbm_alpha_cache_key(arch):
+    return str(arch).strip().lower().replace(" ", "_")
+
+
+def _alpha_summary_csv_path(arch):
+    """Return path to ``config/{arch}_alpha_summary.csv`` if it exists (e.g. mi300x_alpha_summary.csv)."""
+    stem = _hbm_alpha_cache_key(arch)
+    if not stem:
+        return None
+    p = _config_dir / f"{stem}_alpha_summary.csv"
+    return p if p.is_file() else None
+
+
+def _use_hbm_alpha_model(arch):
+    """True when a per-arch α summary CSV is present for *arch*."""
+    return _alpha_summary_csv_path(arch) is not None
+
+
+def _load_jkl_alpha_by_label(arch, sweep):
+    """Load α table from ``{arch}_alpha_summary.csv`` for a given sweep (``hbm`` or ``lds``)."""
+    global _JKL_ALPHA_BY_LABEL_CACHE
+    arch_key = _hbm_alpha_cache_key(arch)
+    sw = str(sweep).strip().lower()
+    cache_key = (arch_key, sw)
+    if cache_key not in _JKL_ALPHA_BY_LABEL_CACHE:
+        path = _alpha_summary_csv_path(arch)
+        if path is None:
+            _JKL_ALPHA_BY_LABEL_CACHE[cache_key] = {}
+        else:
+            d = pd.read_csv(path)
+            if "sweep" in d.columns:
+                d = d[d["sweep"].astype(str).str.lower() == sw]
+            elif "log_basename" in d.columns:
+                prefix = "hbm_" if sw == "hbm" else "lds_" if sw == "lds" else f"{sw}_"
+                d = d[d["log_basename"].astype(str).str.lower().str.startswith(prefix)]
+            _JKL_ALPHA_BY_LABEL_CACHE[cache_key] = {
+                str(row["label"]): float(row["alpha"])
+                for _, row in d.iterrows()
+                if pd.notna(row.get("alpha"))
+            }
+    return _JKL_ALPHA_BY_LABEL_CACHE[cache_key]
+
+
+def _load_hbm_alpha_by_label(arch):
+    """Load HBM α table (HBM sweeps only; lazy, cached per arch)."""
+    return _load_jkl_alpha_by_label(arch, "hbm")
+
+
+def _default_hbm_alpha_fp32_fma(arch):
+    """Alpha for 100% FP32 MulAdd (FMA) from HBM table (for default, non-kernel roofline)."""
+    m = _load_hbm_alpha_by_label(arch)
+    return m.get("fp32_muladd")
+
+
+def _use_lds_alpha_model(arch):
+    """True when JKL summary exists and contains LDS sweep rows."""
+    if not _use_hbm_alpha_model(arch):
+        return False
+    return len(_load_jkl_alpha_by_label(arch, "lds")) > 0
+
+
+def _default_lds_alpha_fp32_fma(arch):
+    """Alpha for 100% FP32 MulAdd (FMA) from LDS table (default roofline when no kernel selected)."""
+    m = _load_jkl_alpha_by_label(arch, "lds")
+    return m.get("fp32_muladd")
+
+
+def _term_time(ops_over_peak):
+    """Sanitize ops/peak time contribution (match _compute_kernel_peak behavior)."""
+    return ops_over_peak.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+
+def _compute_weighted_jkl_alpha(df, peaks, arch, sweep):
+    """Instruction-mix–weighted α using the same per-class times as _compute_kernel_peak."""
+    alpha_map = _load_jkl_alpha_by_label(arch, sweep)
+    terms = {}
+
+    def add_term(label, expr):
+        if label not in alpha_map:
+            return
+        terms[label] = _term_time(expr)
+
+    add_term(
+        "fp16_add",
+        64 * df["SQ_INSTS_VALU_ADD_F16"] / peaks["fp16_add"],
+    )
+    add_term(
+        "fp16_mul",
+        64 * df["SQ_INSTS_VALU_MUL_F16"] / peaks["fp16_mul"],
+    )
+    add_term(
+        "fp16_muladd",
+        64 * 2 * df["SQ_INSTS_VALU_FMA_F16"] / peaks["fp16_muladd"],
+    )
+    add_term(
+        "fp16_rsqrt",
+        64 * df["SQ_INSTS_VALU_TRANS_F16"] / peaks["fp16_trans"],
+    )
+    add_term(
+        "fp32_add",
+        64 * df["SQ_INSTS_VALU_ADD_F32"] / peaks["fp32_add"],
+    )
+    add_term(
+        "fp32_mul",
+        64 * df["SQ_INSTS_VALU_MUL_F32"] / peaks["fp32_mul"],
+    )
+    add_term(
+        "fp32_muladd",
+        64 * 2 * df["SQ_INSTS_VALU_FMA_F32"] / peaks["fp32_muladd"],
+    )
+    add_term(
+        "fp32_rsqrt",
+        64 * df["SQ_INSTS_VALU_TRANS_F32"] / peaks["fp32_trans"],
+    )
+    add_term(
+        "fp64_add",
+        64 * df["SQ_INSTS_VALU_ADD_F64"] / peaks["fp64_add"],
+    )
+    add_term(
+        "fp64_mul",
+        64 * df["SQ_INSTS_VALU_MUL_F64"] / peaks["fp64_mul"],
+    )
+    add_term(
+        "fp64_muladd",
+        64 * 2 * df["SQ_INSTS_VALU_FMA_F64"] / peaks["fp64_muladd"],
+    )
+    add_term(
+        "fp64_rsqrt",
+        64 * df["SQ_INSTS_VALU_TRANS_F64"] / peaks["fp64_trans"],
+    )
+    add_term(
+        "int32_mul",
+        64 * df["SQ_INSTS_VALU_INT32"] / peaks["int32"],
+    )
+    add_term(
+        "int32_muladd",
+        64 * df["SQ_INSTS_VALU_INT64"] / peaks["int64"],
+    )
+    add_term("fp16_mfma", df["TOTAL_MOPS_F16"] / peaks["fp16_mfma"])
+    add_term("bf16_mfma", df["TOTAL_MOPS_BF16"] / peaks["bf16_mfma"])
+    add_term("fp32_mfma", df["TOTAL_MOPS_F32"] / peaks["fp32_mfma"])
+    add_term("fp64_mfma", df["TOTAL_MOPS_F64"] / peaks["fp64_mfma"])
+    if "TOTAL_VALU_OTHER" in df.columns:
+        add_term("int8_leftshift", df["TOTAL_VALU_OTHER"] / peaks["other"])
+    if "fp8_mfma" in peaks and "TOTAL_MOPS_F8" in df.columns:
+        add_term("fp8_mfma", df["TOTAL_MOPS_F8"] / peaks["fp8_mfma"])
+    if "i8_mfma" in peaks and "TOTAL_MOPS_I8" in df.columns:
+        add_term("int8_mfma", df["TOTAL_MOPS_I8"] / peaks["i8_mfma"])
+
+    if not terms:
+        return pd.Series(0.0, index=df.index)
+
+    term_df = pd.DataFrame(terms)
+    t_sum = term_df.sum(axis=1)
+    t_safe = t_sum.replace(0, np.nan)
+
+    a_arr = np.array([alpha_map[c] for c in term_df.columns])
+    alpha_series = (term_df * a_arr).sum(axis=1) / t_safe
+    alpha_series = alpha_series.fillna(0.0)
+    return alpha_series
+
+
+def _compute_weighted_hbm_alpha(df, peaks, arch):
+    """Instruction-mix–weighted HBM α."""
+    return _compute_weighted_jkl_alpha(df, peaks, arch, "hbm")
+
+
+def _compute_weighted_lds_alpha(df, peaks, arch):
+    """Instruction-mix–weighted LDS α."""
+    return _compute_weighted_jkl_alpha(df, peaks, arch, "lds")
+
+
+def _hbm_roof_throughput(x, B, P, alpha):
+    """HBM roof: (1/P + 1/(x*B) - alpha*min(1/P, 1/(x*B)))^-1; x=AI, B=BW peak, P=kernel compute peak."""
+    eps = 1e-30
+    B = float(B)
+    if B <= 0:
+        return pd.Series(0.0, index=x.index)
+
+    x = x.clip(lower=eps)
+    inv_p = 1.0 / P.clip(lower=eps)
+    inv_xb = 1.0 / (x * B)
+    m = np.minimum(inv_p, inv_xb)
+    denom = inv_p + inv_xb - alpha * m
+    linear = np.minimum(x * B, P)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        raw = 1.0 / denom
+    out = raw.where(np.isfinite(raw) & (denom > eps), linear)
+    return out.fillna(linear).clip(lower=0.0)
+
+
+def _percent_roof_achieved(throughput, peak):
+    """Achieved throughput as % of roof PEAK; NaN when ratio is undefined or non-finite."""
+    t = throughput.astype(float)
+    p = peak.astype(float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = t / p * 100.0
+    return r.where(np.isfinite(t) & np.isfinite(p) & (p > 0) & np.isfinite(r))
+
+
+def _exclude_bw_roof_when_no_traffic(peak, bw):
+    """
+    If observed byte traffic at this memory level is zero, that level does not bound the kernel.
+    Use +inf so min() ignores it (linear AI×B would be inf anyway; curved α can misbehave at AI→∞).
+    """
+    b = bw.astype(float)
+    return peak.where(b > 0, np.inf)
+
+
+def _safe_limiters(masked_df, strip_len, limiter_suffix):
+    """Compute limiter labels per row; use 'Unknown' + suffix when a row has no valid (positive) peaks."""
+    # Avoid idxmin on all-NA rows (deprecated → future ValueError); those rows become Unknown via fillna below.
+    all_na = masked_df.isna().all(axis=1)
+    idx = pd.Series(np.nan, index=masked_df.index, dtype=object)
+    has_any = ~all_na
+    if has_any.any():
+        idx.loc[has_any] = masked_df.loc[has_any].idxmin(axis=1)
+    return (idx.str[:-strip_len] + limiter_suffix).fillna("Unknown" + limiter_suffix)
+
+
+def _align_curved_limiter_with_linear_compute(limiter, limiter_linear):
+    """
+    When the curved HBM/LDS α roof falls below compute but the linear roof is compute-bound,
+    idxmin attributes the bottleneck to HBM/LDS. Report KERNEL_COMPUTE as the curved limiter only;
+    PEAK (curved roof) and all linear columns stay unchanged.
+
+    Treat any limiter whose first token starts with `HBM_BW` or `LDS_BW` as the
+    corresponding memory roof family so the alignment still applies.
+    """
+    curved_tag = limiter.str.split().str[0]
+    is_memory_bw = curved_tag.str.startswith("HBM_BW", na=False) | curved_tag.str.startswith(
+        "LDS_BW", na=False
+    )
+    mask = limiter_linear.str.contains("KERNEL_COMPUTE", na=False) & is_memory_bw
+    return limiter.where(~mask, limiter_linear)
+
 
 # Compute total flops, AI's
-def computeFlops(df):
+def compute_flops(df, arch):
+    # Create a dictionary to store all new columns
+    new_columns = {}
 
     # Compute total achieved FLOPs for each datatype (FP16, FP32, FP64)
     ## Scalar Ops
-    df['TOTAL_SALU'] = df['SQ_INSTS_SALU']
+    new_columns['TOTAL_SALU'] = df['SQ_INSTS_SALU']
 
     ## Vector Ops
-    df['TOTAL_VALU_F16'] = 64 * (df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + 2 * df['SQ_INSTS_VALU_FMA_F16'])
-    df['TOTAL_VALU_F32'] = 64 * (df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + 2 * df['SQ_INSTS_VALU_FMA_F32'])
-    df['TOTAL_VALU_F64'] = 64 * (df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + 2 * df['SQ_INSTS_VALU_FMA_F64'])
-    df['TOTAL_VALU_I32'] = 64 * df['SQ_INSTS_VALU_INT32']
-    df['TOTAL_VALU_I64'] = 64 * df['SQ_INSTS_VALU_INT64']
+    new_columns['TOTAL_VALU_F16'] = 64 * (df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + 2 * df['SQ_INSTS_VALU_FMA_F16'])
+    new_columns['TOTAL_VALU_F32'] = 64 * (df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + 2 * df['SQ_INSTS_VALU_FMA_F32'])
+    new_columns['TOTAL_VALU_F64'] = 64 * (df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + 2 * df['SQ_INSTS_VALU_FMA_F64'])
+    new_columns['TOTAL_VALU_I32'] = 64 * df['SQ_INSTS_VALU_INT32']
+    new_columns['TOTAL_VALU_I64'] = 64 * df['SQ_INSTS_VALU_INT64']
 
     ## Matrix Ops
-    df['TOTAL_MOPS_F16'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F16']
-    df['TOTAL_MOPS_BF16'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_BF16']
-    df['TOTAL_MOPS_F32'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F32']
-    df['TOTAL_MOPS_F64'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F64']
+    new_columns['TOTAL_MOPS_F16'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F16']
+    new_columns['TOTAL_MOPS_BF16'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_BF16']
+    new_columns['TOTAL_MOPS_F32'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F32']
+    new_columns['TOTAL_MOPS_F64'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F64']
+    if 'SQ_INSTS_VALU_MFMA_MOPS_F8' in df.columns:
+        new_columns['TOTAL_MOPS_F8'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F8']
+    if 'SQ_INSTS_VALU_MFMA_MOPS_I8' in df.columns:
+        new_columns['TOTAL_MOPS_I8'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_I8']
 
     # Other VALU Ops (e.g. Int16, Int8)
     if 'SQ_INSTS_VALU' in df.columns:
-        df['TOTAL_VALU_OTHER'] = 64 * (df['SQ_INSTS_VALU'] - (df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + df['SQ_INSTS_VALU_FMA_F16'] + df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + df['SQ_INSTS_VALU_FMA_F32'] + df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + df['SQ_INSTS_VALU_FMA_F64'] + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64'] + df['SQ_INSTS_VALU_MFMA_MOPS_F16'] + df['SQ_INSTS_VALU_MFMA_MOPS_BF16'] + df['SQ_INSTS_VALU_MFMA_MOPS_F32'] + df['SQ_INSTS_VALU_MFMA_MOPS_F64']))
+        new_columns['TOTAL_VALU_OTHER'] = 64 * (df['SQ_INSTS_VALU'] - (df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + df['SQ_INSTS_VALU_FMA_F16'] + df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + df['SQ_INSTS_VALU_FMA_F32'] + df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + df['SQ_INSTS_VALU_FMA_F64'] + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64']))
 
+    # Concat first batch of columns
+    df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
     ## Total
-    df['TOTAL_OPS'] = df['TOTAL_SALU'] + df['TOTAL_VALU_F16'] + df['TOTAL_VALU_F32'] + df['TOTAL_VALU_F64'] + df['TOTAL_VALU_I32'] + df['TOTAL_VALU_I64'] + df['TOTAL_MOPS_F16'] + df['TOTAL_MOPS_BF16'] + df['TOTAL_MOPS_F32'] + df['TOTAL_MOPS_F64']
+    TOTAL_OPS = df['TOTAL_SALU'] + df['TOTAL_VALU_F16'] + df['TOTAL_VALU_F32'] + df['TOTAL_VALU_F64'] + df['TOTAL_VALU_I32'] + df['TOTAL_VALU_I64'] + df['TOTAL_MOPS_F16'] + df['TOTAL_MOPS_BF16'] + df['TOTAL_MOPS_F32'] + df['TOTAL_MOPS_F64']
     if 'SQ_INSTS_VALU' in df.columns:
-        df['TOTAL_OPS'] = df['TOTAL_OPS'] + df['TOTAL_VALU_OTHER']
+        TOTAL_OPS = TOTAL_OPS + df['TOTAL_VALU_OTHER']
+    if 'SQ_INSTS_VALU_MFMA_MOPS_F8' in df.columns:
+        TOTAL_OPS = TOTAL_OPS + df['TOTAL_MOPS_F8']
+    if 'SQ_INSTS_VALU_MFMA_MOPS_I8' in df.columns:
+        TOTAL_OPS = TOTAL_OPS + df['TOTAL_MOPS_I8']
+
+    new_columns = {}
+    new_columns['TOTAL_OPS'] = TOTAL_OPS
 
     # Compute Bandwidths
     ## LDS
-    df['BW_LDS'] = 32 * 4 * (df['SQ_LDS_IDX_ACTIVE'] - df['SQ_LDS_BANK_CONFLICT'])
-    df['BW_LDS_ATOMICS'] = 64 * (df['TCP_TCC_ATOMIC_WITH_RET_REQ_sum'] + df['TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum'])
+    new_columns['BW_LDS'] = 32 * 4 * (df['SQ_LDS_IDX_ACTIVE'] - df['SQ_LDS_BANK_CONFLICT'])
+    new_columns['BW_LDS_ATOMICS'] = 64 * (df['TCP_TCC_ATOMIC_WITH_RET_REQ_sum'] + df['TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum'])
 
     ## L2
-    df['BW_L2'] = 64 * df['TCP_TCC_READ_REQ_sum'] + 64 * df['TCP_TCC_WRITE_REQ_sum'] + df['BW_LDS_ATOMICS']
+    if 'TCC_REQ_sum' in df.columns:
+        new_columns['BW_L2'] = 128 * df['TCC_REQ_sum']
+    else:
+        # Less reliable calculation kept to be backwards compatible with earlier rooflineExtractor versions
+        new_columns['BW_L2'] = 64 * df['TCP_TCC_READ_REQ_sum'] + 64 * df['TCP_TCC_WRITE_REQ_sum'] + new_columns['BW_LDS_ATOMICS']
 
     ## vL1D
-    df['BW_vL1d'] = 64 * df['TCP_TOTAL_CACHE_ACCESSES_sum']
-
-    arch = ""
+    if 'SQ_INSTS_VMEM_WR' in df.columns:
+        new_columns['BW_vL1d'] = 256 * (df['SQ_INSTS_VMEM_WR'] + df['SQ_INSTS_VMEM_RD'])
+    else:
+        # Less reliable calculation kept to be backwards compatible with earlier rooflineExtractor versions
+        new_columns['BW_vL1d'] = 128 * df['TCP_TOTAL_CACHE_ACCESSES_sum']
 
     ## HBM
     ### Check architecture
-    if df.keys().str.contains('TCC_BUBBLE').sum() > 0:
-        # We have a gfx942 or gfx950 arch counter file
-        arch = "MI300x"
-        df['BW_HBM'] = 128 * df['TCC_BUBBLE_sum'] + 32 * df['TCC_EA0_RDREQ_32B_sum'] + 64 * (df['TCC_EA0_RDREQ_sum'] - df['TCC_BUBBLE_sum'] - df['TCC_EA0_RDREQ_32B_sum']) + 32 * (df['TCC_EA0_WRREQ_sum'] - df['TCC_EA0_WRREQ_64B_sum']) + 64 * df['TCC_EA0_WRREQ_64B_sum']
+    _gfx950_hbm_dram = (
+        'TCC_EA0_WRREQ_WRITE_DRAM_32B_sum',
+        'TCC_EA0_RDREQ_DRAM_32B_sum',
+        'TCC_EA0_WRREQ_ATOMIC_DRAM_32B_sum',
+    )
+    if ('MI35' in arch) and all(c in df.columns for c in _gfx950_hbm_dram):
+        # Count 32-byte read, write, and atomic requests to HBM
+        # 1 64-byte request will be counted as 2, 1 128-byte (read) will be counted as 4
+        new_columns['BW_HBM'] = (
+            32 * df['TCC_EA0_WRREQ_WRITE_DRAM_32B_sum']
+            + 32 * df['TCC_EA0_RDREQ_DRAM_32B_sum']
+            + 32 * df['TCC_EA0_WRREQ_ATOMIC_DRAM_32B_sum']
+        )
+    elif df.keys().str.contains('TCC_BUBBLE').sum() > 0:
+        # We have a gfx942 or gfx950 arch counter file (legacy HBM model without gfx950 DRAM 32B sums for backward compatibility)
+        new_columns['BW_HBM'] = 128 * df['TCC_BUBBLE_sum'] + 32 * df['TCC_EA0_RDREQ_32B_sum'] + 64 * (df['TCC_EA0_RDREQ_sum'] - df['TCC_BUBBLE_sum'] - df['TCC_EA0_RDREQ_32B_sum']) + 32 * (df['TCC_EA0_WRREQ_sum'] - df['TCC_EA0_WRREQ_64B_sum']) + 64 * df['TCC_EA0_WRREQ_64B_sum']
     else:
         # Assuming gfx90a
-        arch = "MI250"
-        df['BW_HBM'] = 32 * df['TCC_EA_RDREQ_32B_sum'] + 64 * (df['TCC_EA_RDREQ_sum'] - df['TCC_EA_RDREQ_32B_sum']) + 32 * (df['TCC_EA_WRREQ_sum'] - df['TCC_EA_WRREQ_64B_sum']) + 64 * df['TCC_EA_WRREQ_64B_sum']
+        new_columns['BW_HBM'] = 32 * df['TCC_EA_RDREQ_32B_sum'] + 64 * (df['TCC_EA_RDREQ_sum'] - df['TCC_EA_RDREQ_32B_sum']) + 32 * (df['TCC_EA_WRREQ_sum'] - df['TCC_EA_WRREQ_64B_sum']) + 64 * df['TCC_EA_WRREQ_64B_sum']
+
+    # Concat bandwidth columns
+    df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
     # Compute AI for each part of memory hierarchy (HBM, L2, L1)
-    ## LDS
-    df['AI_LDS_TOT'] = df['TOTAL_OPS'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_SALU'] = df['TOTAL_SALU'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_VALU_F16'] = df['TOTAL_VALU_F16'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_VALU_F32'] = df['TOTAL_VALU_F32'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_VALU_F64'] = df['TOTAL_VALU_F64'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_VALU_I32'] = df['TOTAL_VALU_I32'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_VALU_I64'] = df['TOTAL_VALU_I64'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_MOPS_F16'] = df['TOTAL_MOPS_F16'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_MOPS_BF16'] = df['TOTAL_MOPS_BF16'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_MOPS_F32'] = df['TOTAL_MOPS_F32'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_LDS_MOPS_F64'] = df['TOTAL_MOPS_F64'].divide(df['BW_LDS']).replace(np.inf, 0).replace(np.nan, 0)
-    ## L2
-    df['AI_L2_TOT'] = df['TOTAL_OPS'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_SALU'] = df['TOTAL_SALU'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_VALU_F16'] = df['TOTAL_VALU_F16'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_VALU_F32'] = df['TOTAL_VALU_F32'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_VALU_F64'] = df['TOTAL_VALU_F64'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_VALU_I32'] = df['TOTAL_VALU_I32'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_VALU_I64'] = df['TOTAL_VALU_I64'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_MOPS_F16'] = df['TOTAL_MOPS_F16'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_MOPS_BF16'] = df['TOTAL_MOPS_BF16'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_MOPS_F32'] = df['TOTAL_MOPS_F32'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_L2_MOPS_F64'] = df['TOTAL_MOPS_F64'].divide(df['BW_L2']).replace(np.inf, 0).replace(np.nan, 0)
-    ## vL1D
-    df['AI_vL1d_TOT'] = df['TOTAL_OPS'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_SALU'] = df['TOTAL_SALU'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_VALU_F16'] = df['TOTAL_VALU_F16'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_VALU_F32'] = df['TOTAL_VALU_F32'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_VALU_F64'] = df['TOTAL_VALU_F64'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_VALU_I32'] = df['TOTAL_VALU_I32'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_VALU_I64'] = df['TOTAL_VALU_I64'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_MOPS_F16'] = df['TOTAL_MOPS_F16'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_MOPS_BF16'] = df['TOTAL_MOPS_BF16'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_MOPS_F32'] = df['TOTAL_MOPS_F32'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_vL1d_MOPS_F64'] = df['TOTAL_MOPS_F64'].divide(df['BW_vL1d']).replace(np.inf, 0).replace(np.nan, 0)
-    ## HBM
-    df['AI_HBM_TOT'] = df['TOTAL_OPS'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_SALU'] = df['TOTAL_SALU'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_VALU_F16'] = df['TOTAL_VALU_F16'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_VALU_F32'] = df['TOTAL_VALU_F32'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_VALU_F64'] = df['TOTAL_VALU_F64'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_VALU_I32'] = df['TOTAL_VALU_I32'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_VALU_I64'] = df['TOTAL_VALU_I64'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_MOPS_F16'] = df['TOTAL_MOPS_F16'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_MOPS_BF16'] = df['TOTAL_MOPS_BF16'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_MOPS_F32'] = df['TOTAL_MOPS_F32'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
-    df['AI_HBM_MOPS_F64'] = df['TOTAL_MOPS_F64'].divide(df['BW_HBM']).replace(np.inf, 0).replace(np.nan, 0)
+    new_columns = {}
+
+    for mem_level in ['LDS', 'L2', 'vL1d', 'HBM']:
+        new_columns.update(_compute_ai_columns(df, mem_level))
+
+    # Concat AI columns
+    df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
     # Add columns for peaks
-    df['HBM_BW_PEAK'] = df['AI_HBM_TOT'] * caches[arch]['HBM']
-    df['L2_BW_PEAK'] = df['AI_L2_TOT'] * caches[arch]['L2']
-    df['vL1d_BW_PEAK'] = df['AI_vL1d_TOT'] * caches[arch]['vL1d']
-    df['LDS_BW_PEAK'] = df['AI_LDS_TOT'] * caches[arch]['LDS']
-    df = pd.concat([df, pd.DataFrame({'COMPUTE_PEAK': [compute_peaks[arch]] * len(df)})], axis=1)
+    new_columns = {}
+    new_columns['HBM_BW_PEAK'] = df['AI_HBM_TOT'] * caches[arch]['HBM']
+    new_columns['L2_BW_PEAK'] = df['AI_L2_TOT'] * caches[arch]['L2']
+    new_columns['vL1d_BW_PEAK'] = df['AI_vL1d_TOT'] * caches[arch]['vL1d']
+    new_columns['LDS_BW_PEAK'] = df['AI_LDS_TOT'] * caches[arch]['LDS']
+    # Linear AI×peak-BW roofs for HBM/LDS (same functional form as L2/vL1d); retained when α model replaces curved HBM/LDS peaks.
+    new_columns['HBM_BW_PEAK_LINEAR'] = df['AI_HBM_TOT'] * caches[arch]['HBM']
+    new_columns['LDS_BW_PEAK_LINEAR'] = df['AI_LDS_TOT'] * caches[arch]['LDS']
+
+    # Concat peak columns
+    df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
+
+    bw_path = _config_dir / "benchWarmer.csv"
+    df_bw = pd.read_csv(bw_path)
+    peaks = _load_peaks(df_bw, arch, df)
+
+    # Calculate kernel-specific compute peak for current architecture
+    new_columns = {}
+    new_columns['KERNEL_COMPUTE_PEAK'] = _compute_kernel_peak(df, peaks)
+    new_columns['COMPUTE_PEAK'] = peaks['fp32_muladd']
+
+    # Concat compute peak columns
+    df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
+
+    if _use_hbm_alpha_model(arch):
+        alpha_base = _compute_weighted_hbm_alpha(df, peaks, arch)
+        df["HBM_BW_PEAK"] = _exclude_bw_roof_when_no_traffic(
+            _hbm_roof_throughput(
+                df["AI_HBM_TOT"],
+                caches[arch]["HBM"],
+                df["KERNEL_COMPUTE_PEAK"],
+                alpha_base,
+            ),
+            df["BW_HBM"],
+        )
+        df["HBM_ALPHA"] = alpha_base
+
+    if _use_lds_alpha_model(arch):
+        lds_alpha_base = _compute_weighted_lds_alpha(df, peaks, arch)
+        df["LDS_BW_PEAK"] = _exclude_bw_roof_when_no_traffic(
+            _hbm_roof_throughput(
+                df["AI_LDS_TOT"],
+                caches[arch]["LDS"],
+                df["KERNEL_COMPUTE_PEAK"],
+                lds_alpha_base,
+            ),
+            df["BW_LDS"],
+        )
+        df["LDS_ALPHA"] = lds_alpha_base
 
     # Determine performance peak/limiter
-    df_peaks = df[['HBM_BW_PEAK','L2_BW_PEAK','vL1d_BW_PEAK','LDS_BW_PEAK','COMPUTE_PEAK']]
+    df_peaks = df[['HBM_BW_PEAK','L2_BW_PEAK','vL1d_BW_PEAK','LDS_BW_PEAK','KERNEL_COMPUTE_PEAK']]
     peaks = df_peaks.where(df_peaks > 0).min(axis=1)
-    limiters = df_peaks.where(df_peaks > 0).idxmin(axis=1).str[:-5] + f" ({arch})"
+    limiters = _safe_limiters(df_peaks.where(df_peaks > 0), 5, f" ({arch})")
 
-    df = pd.concat([df, pd.DataFrame({'PEAK': peaks, 'LIMITER': limiters})], axis=1)
+    df_peaks_linear = df[
+        ['HBM_BW_PEAK_LINEAR', 'L2_BW_PEAK', 'vL1d_BW_PEAK', 'LDS_BW_PEAK_LINEAR', 'KERNEL_COMPUTE_PEAK']
+    ]
+    peaks_linear = df_peaks_linear.where(df_peaks_linear > 0).min(axis=1)
+    limiters_linear = _safe_limiters(df_peaks_linear.where(df_peaks_linear > 0), 5, f" ({arch})")
+
+    limiters = _align_curved_limiter_with_linear_compute(limiters, limiters_linear)
+
+    new_columns = {}
+    new_columns['PEAK'] = peaks
+    new_columns['LIMITER'] = limiters
+    new_columns['PEAK_LINEAR'] = peaks_linear
+    new_columns['LIMITER_LINEAR'] = limiters_linear
+
+    # Concat peak/limiter columns
+    df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
 
     return df
 
 
-df_roof = computeFlops(df_roof)  # Compute AI's for each kernel dispatch
-
-# Check for rocprofv3 and convert to v1 format
-if 'Agent_Id' in df_roof.columns:
-    df_roof = df_roof.drop(columns=['Agent_Id'])
-    df_roof = df_roof.rename(columns={'Dispatch_Id':'Index'})
-    df_roof = df_roof.rename(columns={'Kernel_Name':'KernelName'})
-
-# Aggregate kernels
-df = df_roof.groupby('KernelName', sort=False).mean(numeric_only=True).reset_index()
-
-
-# Get runtime stats
-df_runtime = pd.read_csv(args.results)
-
-if 'Kernel_Name' in df_runtime.columns:
-    df_runtime = df_runtime.rename(columns={'Kernel_Name':'KernelName'})
-    df_runtime['DurationNs'] = df_runtime['End_Timestamp'] - df_runtime['Start_Timestamp']
-    df_runtime = df_runtime.rename(columns={'Dispatch_Id':'Index'})
-
-totalRuntimes = df_runtime.groupby('KernelName')['DurationNs'].sum()
-averageRuntimes = df_runtime.groupby('KernelName')['DurationNs'].mean()
-percentRuntimes = df_runtime.groupby('KernelName').sum()['DurationNs']/df_runtime['DurationNs'].sum()*100
-
-df = pd.merge(df, totalRuntimes, on='KernelName').rename(columns={"DurationNs":"RuntimeNs"})
-df = pd.merge(df, averageRuntimes, on='KernelName').rename(columns={"DurationNs":"AverageNs"})
-df = pd.merge(df, percentRuntimes, on='KernelName').rename(columns={"DurationNs":"Percentage"})
-# Add column for number of kernels
-df = df.merge(df_roof.groupby('KernelName', sort=False).size().reset_index(name='Count'), on='KernelName')
-
-insigKernels = len(df[df['Percentage'] < sigRuntime])  # save this value for guided analysis
-
-df_roof = df_roof.merge(df_runtime, on='Index')
-
-# Plot the AIs
-if args.plot:
-    ## Extract/format the data for clustering
-    columns = [c for c in df.columns if c.startswith('AI_')]
-    p_df = df.filter(['KernelName'] + ['Percentage'] + columns, axis=1)
-    p_df = p_df.sort_values(by='Percentage').tail(5)
-    p_df.index = p_df['KernelName']
-    p_df.drop('KernelName', axis=1, inplace=True)
-    p_df = p_df.transpose()
-    ax = p_df.plot(kind="bar")
-    fig = ax.get_figure()
-    fig.set_size_inches(24,12)
-    fig.tight_layout(pad=3, rect=[0,0,0.7,0.98])
-    #fig.subplots_adjust(bottom=0.15, left=0.05)
-    ax.set_xlabel("<AI_MEM_COMPUTE_DATATYPE>")
-    ax.set_ylabel("Arithmetic Intensity (Ops/Byte)")
-    ax.set_title(roofCountFilename)
-    ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha='right')
-    ax.set_yscale('log')
-    ax.legend(loc='upper left', bbox_to_anchor=(1.04,1))
-    fig.savefig(roofCountFilename + '_plot.png')
+def _wrap_kernel_name_tooltip(name, width=50, max_lines=3):
+    """Wrap long kernel names for tooltip display (newline-separated)."""
+    if not name:
+        return ""
+    max_chars = width * max_lines
+    if len(name) <= max_chars:
+        return "\n".join(name[i : i + width] for i in range(0, len(name), width))
+    truncated = name[: max_chars - 3] + "..."
+    return "\n".join(truncated[i : i + width] for i in range(0, len(truncated), width))
 
 
+def _json_safe_float(x):
+    """Finite float for JSON, or None. Browsers' JSON.parse rejects Infinity/NaN (Python json emits them by default)."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(v):
+        return None
+    return v
 
 
-# Get telemetry data
-if args.hw_metrics != None:
-    df_hw = pd.read_csv(args.hw_metrics)
-    if df_hw.empty:
-        print('Input hw metrics file is empty')
+_D3_CDN_URL = "https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"
+_D3_LOCAL_PATH = Path(__file__).parent / "d3.min.js"
+
+
+def _d3_script_tag():
+    """Return an inline <script> with the bundled D3 source, or a CDN <script src> fallback."""
+    if _D3_LOCAL_PATH.is_file():
+        d3_src = _D3_LOCAL_PATH.read_text(encoding="utf-8")
+        return f"<script>{d3_src}</script>"
+    return f'<script src="{_D3_CDN_URL}"></script>'
+
+
+def _build_roofline_d3_html(payload):
+    json_str = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+    json_str = json_str.replace("</", "<\\/")
+    html = _ROOFLINE_D3_HTML_TEMPLATE.replace("__D3_SCRIPT__", _d3_script_tag())
+    return html.replace("__PAYLOAD__", json_str)
+
+
+_ROOFLINE_D3_HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en" class="theme-dark">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Roofline</title>
+__D3_SCRIPT__
+<style>
+  :root.theme-light {
+    --plot-bg: #ffffff;
+    --paper-bg: #f9f9f9;
+    --fg: #111111;
+    --grid: #d3d3d3;
+    --axis: #000000;
+    --tooltip-bg: rgba(255,255,255,0.95);
+    --tooltip-fg: #111111;
+    --tooltip-border: #888;
+  }
+  :root.theme-dark {
+    --plot-bg: #000000;
+    --paper-bg: #0a0a0a;
+    --fg: #eeeeee;
+    --grid: #555555;
+    --axis: #ffffff;
+    --tooltip-bg: rgba(30,30,30,0.95);
+    --tooltip-fg: #eeeeee;
+    --tooltip-border: #666;
+  }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: system-ui, sans-serif;
+    background: var(--paper-bg);
+    color: var(--fg);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    box-sizing: border-box;
+  }
+  #roofline-app {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    width: 100%;
+    max-width: none;
+    margin: 0 auto;
+    padding: 12px 16px 24px;
+    box-sizing: border-box;
+  }
+  .chart-row {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  #chart-wrap {
+    flex: 1 1 480px;
+    min-width: 200px;
+    /* min-height:0 lets flex constrain height; without it, min-size follows SVG and fights ResizeObserver */
+    min-height: 0;
+    overflow: hidden;
+    width: 100%;
+    background: var(--plot-bg);
+    border: 1px solid var(--grid);
+    border-radius: 4px;
+    box-sizing: border-box;
+  }
+  .kernel-legend-panel {
+    flex: 0 1 320px;
+    max-width: min(480px, 100%);
+    align-self: stretch;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    max-height: min(560px, calc(100vh - 200px));
+    border: 1px solid var(--grid);
+    border-radius: 6px;
+    padding: 10px 12px;
+    background: var(--plot-bg);
+    font-size: 11px;
+    line-height: 1.35;
+    box-sizing: border-box;
+  }
+  /* Legend to the right of plot: height at most matches the chart row; shorter if few kernels */
+  @media (min-width: 900px) {
+    .kernel-legend-panel {
+      align-self: flex-start;
+      max-height: 100%;
+    }
+  }
+  .kernel-legend-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .kernel-swatch {
+    flex-shrink: 0;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    margin-top: 3px;
+    border: 1px solid rgba(0,0,0,0.2);
+  }
+  .theme-dark .kernel-swatch { border-color: rgba(255,255,255,0.25); }
+  .kernel-name { flex: 1 1 auto; min-width: 0; }
+  .kernel-pct { flex-shrink: 0; opacity: 0.85; white-space: nowrap; }
+  .kernel-legend-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .kernel-legend-heading {
+    margin: 0;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .kernel-legend-clear {
+    font-size: 0.75rem;
+    padding: 3px 10px;
+    cursor: pointer;
+    border: 1px solid var(--grid);
+    border-radius: 4px;
+    background: var(--paper-bg);
+    color: var(--fg);
+  }
+  .kernel-legend-help {
+    font-size: 0.72rem;
+    opacity: 0.78;
+    margin: 0 0 8px 0;
+    color: var(--fg);
+    line-height: 1.3;
+  }
+  .kernel-legend-list li {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    word-break: break-word;
+    cursor: pointer;
+    user-select: none;
+    border-radius: 4px;
+    padding: 3px 5px;
+    margin: 1px -5px;
+    transition: opacity 0.12s ease, background 0.12s ease;
+  }
+  .kernel-legend-list li.kernel-legend-selected {
+    background: rgba(99, 110, 250, 0.2);
+    outline: 1px solid rgba(99, 110, 250, 0.5);
+  }
+  .kernel-legend-list li.kernel-legend-dimmed {
+    opacity: 0.4;
+  }
+  .roofline-swatch {
+    flex-shrink: 0;
+    width: 22px;
+    height: 3px;
+    margin-top: 6px;
+    background: #636EFA;
+    border-radius: 1px;
+  }
+  .legend-divider {
+    border: 0;
+    border-top: 1px solid var(--grid);
+    margin: 12px 0;
+    flex-shrink: 0;
+  }
+  .theme-dark .kernel-legend-list li.kernel-legend-selected {
+    background: rgba(99, 110, 250, 0.25);
+  }
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 12px 0; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; margin-bottom: 12px; }
+  .toolbar label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
+  .toolbar select, .toolbar button { font-size: 0.9rem; padding: 4px 8px; }
+  #chart-wrap svg { display: block; }
+  .roofline-path { fill: none; stroke-linejoin: round; pointer-events: none; }
+  .roofline-hit { fill: none; stroke: transparent; pointer-events: stroke; cursor: pointer; }
+  .dot { stroke: rgba(0,0,0,0.25); stroke-width: 0.5; }
+  .axis text { fill: var(--fg); font-size: 11px; }
+  .axis line, .axis path { stroke: var(--axis); }
+  .grid line { stroke: var(--grid); stroke-opacity: 0.9; }
+  #disclaimer { font-size: 12px; margin-top: 8px; text-align: right; color: var(--fg); opacity: 0.85; }
+  .chart-hint { font-size: 0.8rem; color: var(--fg); opacity: 0.75; margin: 0 0 8px 0; }
+  .axis-title { fill: var(--fg); font-weight: 600; font-size: 13px; }
+  .legend-box { font-size: 11px; }
+  .legend-bg { fill: var(--plot-bg); stroke: var(--grid); stroke-width: 1; opacity: 0.94; }
+  .legend-title { font-weight: 600; font-size: 11px; fill: var(--fg); }
+  .legend-row-label { fill: var(--fg); font-size: 11px; }
+  #tooltip {
+    position: fixed; pointer-events: none; z-index: 50;
+    background: var(--tooltip-bg); color: var(--tooltip-fg);
+    border: 1px solid var(--tooltip-border); border-radius: 4px;
+    padding: 8px 10px; font-size: 12px; line-height: 1.35; max-width: 420px;
+    white-space: pre-line; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    display: none;
+  }
+</style>
+</head>
+<body>
+<div id="roofline-app">
+  <h1 id="chart-title"></h1>
+  <div class="toolbar">
+    <label>Memory region
+      <select id="memory-region-select" aria-label="Memory hierarchy for arithmetic intensity"></select>
+    </label>
+    <label>View
+      <select id="view-type-select" aria-label="Aggregate or per-dispatch kernels">
+        <option value="aggregate" selected>Aggregate</option>
+        <option value="individual">Individual (dispatches)</option>
+      </select>
+    </label>
+    <label>Total percent runtime displayed
+      <input type="range" id="threshold-slider" min="0" max="0" value="0" step="1"/>
+      <span id="threshold-label"></span>
+    </label>
+    <label>&nbsp;
+      <span style="display:flex; gap:8px; flex-wrap:wrap;">
+        <button type="button" id="btn-theme-toggle" aria-pressed="true" title="Switch to light theme">Light mode</button>
+        <button type="button" id="btn-hbm-lds-roofline-toggle" hidden aria-pressed="true" title="Use piecewise-linear roofs for HBM and LDS">Linear HBM/LDS</button>
+        <button type="button" id="btn-reset-zoom" title="Reset axes to default range">Reset zoom</button>
+      </span>
+    </label>
+  </div>
+  <p class="chart-hint">Scroll to zoom, drag to pan (double-click chart to reset).</p>
+  <div class="chart-row">
+    <div id="chart-wrap"></div>
+    <aside class="kernel-legend-panel" aria-label="Kernel and bandwidth roofline legends">
+      <div class="kernel-legend-header">
+        <h2 class="kernel-legend-heading" id="kernel-legend-heading">Kernels</h2>
+        <button type="button" class="kernel-legend-clear" id="kernel-legend-clear" hidden>Show all kernels</button>
+      </div>
+      <p class="kernel-legend-help" id="kernel-legend-help">Click a row to show only that kernel; click again to show all. Ctrl+click (⌘+click on Mac) to add or remove kernels.</p>
+      <ul class="kernel-legend-list" id="kernel-legend-list" role="list"></ul>
+      <hr class="legend-divider" />
+      <div class="kernel-legend-header">
+        <h2 class="kernel-legend-heading" id="roofline-legend-heading">Bandwidth rooflines</h2>
+        <button type="button" class="kernel-legend-clear" id="roofline-legend-clear" hidden>Show all rooflines</button>
+      </div>
+      <p class="kernel-legend-help" id="roofline-legend-help">Click a row to show only that roofline; click again to show all. Ctrl+click (⌘+click on Mac) to add or remove rooflines.</p>
+      <ul class="kernel-legend-list" id="roofline-legend-list" role="list"></ul>
+    </aside>
+  </div>
+  <div id="disclaimer"></div>
+</div>
+<script type="application/json" id="roofline-json">__PAYLOAD__</script>
+<script>
+(function() {
+  const data = JSON.parse(document.getElementById("roofline-json").textContent);
+  const meta = data.meta;
+  const cacheKeys = data.cacheKeys;
+  const rooflinePalette = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3"];
+  function rooflineColorForIndex(i) { return rooflinePalette[i % rooflinePalette.length]; }
+  function rooflineColorForKey(key) {
+    const idx = cacheKeys.indexOf(key);
+    return idx < 0 ? rooflinePalette[0] : rooflineColorForIndex(idx);
+  }
+  /** When false, HBM/LDS use linear min(AI×B, P) even if α model metadata is present. */
+  let useCurvedHbmLdsRooflines = true;
+  document.getElementById("chart-title").textContent = meta.title;
+  const disc = document.getElementById("disclaimer");
+  disc.textContent = meta.disclaimer || "";
+
+  let W = 960, H = 560;
+  const margin = { top: 36, right: 36, bottom: 62, left: 86 };
+  let iw = W - margin.left - margin.right;
+  let ih = H - margin.top - margin.bottom;
+
+  const x0 = d3.scaleLog().domain([meta.xMin, meta.xMax]).range([0, iw])
+  const y0 = d3.scaleLog().domain([meta.yMin, meta.yMax]).range([ih, 0])
+  let transform = d3.zoomIdentity;
+  function currentScales() {
+    return { x: transform.rescaleX(x0), y: transform.rescaleY(y0) };
+  }
+
+  const svg = d3.select("#chart-wrap").append("svg")
+    .attr("width", W).attr("height", H).attr("viewBox", "0 0 " + W + " " + H);
+
+  svg.append("defs").append("clipPath").attr("id", "roofline-plot-clip")
+    .append("rect").attr("id", "roofline-clip-rect").attr("width", iw).attr("height", ih);
+  const clipRect = svg.select("#roofline-clip-rect");
+
+  const g = svg.append("g").attr("transform", "translate(" + margin.left + "," + margin.top + ")");
+
+  const xGridG = g.append("g").attr("class", "grid");
+  const yGridG = g.append("g").attr("class", "grid");
+
+  const tooltip = d3.select("body").append("div").attr("id", "tooltip");
+
+  function rooflineTooltipHtml(cacheKey) {
+    const nl = String.fromCharCode(10);
+    const hbmAlphaOn = useCurvedHbmLdsRooflines && meta.useHbmAlphaModel === true && cacheKey === "HBM" && hbmAlphaForRoofline() != null;
+    const ldsAlphaOn = useCurvedHbmLdsRooflines && meta.useLdsAlphaModel === true && cacheKey === "LDS" && ldsAlphaForRoofline() != null;
+    const curvedOn = hbmAlphaOn || ldsAlphaOn;
+    const curvedBand = hbmAlphaOn
+      ? (" (" + (meta.hbmAlphaArch || "") + " HBM)")
+      : ldsAlphaOn
+        ? (" (" + (meta.ldsAlphaArch || "") + " LDS)")
+        : "";
+    const lines = [
+      cacheKey + " bandwidth roofline",
+      curvedOn
+        ? ("Model: (1/P + 1/(AI×B) − α·min(1/P, 1/(AI×B)))⁻¹; P=compute, B=bandwidth" + curvedBand + ".")
+        : "Model: throughput = min(bandwidth × AI, compute peak)."
+    ];
+    const bw = data.bandwidths && data.bandwidths[cacheKey];
+    if (bw != null && Number.isFinite(bw)) {
+      const bwTbs = bw / 1000;
+      lines.push("Bandwidth (slope): " + bwTbs.toLocaleString(undefined, { maximumFractionDigits: 4 }) + " TB/s");
+    }
+    const cp = effectiveComputePeak();
+    if (cp != null && Number.isFinite(cp)) {
+      lines.push("Compute peak (flat roof): " + cp.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " GFLOPs/s");
+    }
+    if (hbmAlphaOn && cacheKey === "HBM") {
+      if (kernelHbmAlpha() != null) {
+        lines.push("α: instruction-mix weighted (hovered or selected kernel).");
+      } else if (meta.defaultHbmAlphaFp32Fma != null && Number.isFinite(meta.defaultHbmAlphaFp32Fma)) {
+        lines.push("α: FP32 MulAdd (FMA) microbenchmark (100% FMA default).");
+      }
+      lines.push(computeRoofFlatDisclaimer());
+    } else if (ldsAlphaOn && cacheKey === "LDS") {
+      if (kernelLdsAlpha() != null) {
+        lines.push("α: instruction-mix weighted (hovered or selected kernel).");
+      } else if (meta.defaultLdsAlphaFp32Fma != null && Number.isFinite(meta.defaultLdsAlphaFp32Fma)) {
+        lines.push("α: FP32 MulAdd (FMA) microbenchmark (100% FMA default).");
+      }
+      lines.push(computeRoofFlatDisclaimer());
+    } else if (roofHoverDispatchComputePeak != null) {
+      lines.push("(Instruction-mix ceiling for hovered dispatch)");
+    } else if (roofHoverKernelName != null) {
+      lines.push("(Instruction-mix ceiling for hovered kernel)");
+    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
+      lines.push("(Instruction-mix ceiling for selected kernel)");
+    } else {
+      lines.push("Compute peak is currently drawn according to FP32 FMA, not kernel-specific instruction mix.");
+    }
+    return lines.join(nl);
+  }
+
+  const plotInner = g.append("g").attr("clip-path", "url(#roofline-plot-clip)");
+  const roofGroup = plotInner.append("g").attr("class", "rooflines");
+  data.rooflines.forEach((rl, i) => {
+    const pts = rl.x.map((xv, j) => [xv, rl.y[j]]);
+    roofGroup.append("path")
+      .datum(pts)
+      .attr("class", "roofline-path")
+      .attr("data-idx", i)
+      .attr("stroke", rooflineColorForIndex(i));
+    roofGroup.append("path")
+      .datum(pts)
+      .attr("class", "roofline-hit")
+      .attr("data-idx", i)
+      .attr("data-cache-key", rl.key)
+      .attr("stroke-width", 16);
+  });
+  roofGroup.selectAll(".roofline-hit")
+    .on("mouseenter", function() {
+      const key = d3.select(this).attr("data-cache-key");
+      tooltip.style("display", "block").text(rooflineTooltipHtml(key));
+    })
+    .on("mousemove", function(event) {
+      tooltip.style("left", (event.clientX + 14) + "px").style("top", (event.clientY + 14) + "px");
+    })
+    .on("mouseleave", function() {
+      tooltip.style("display", "none");
+    })
+    .on("click", function(event) {
+      event.stopPropagation();
+      const key = d3.select(this).attr("data-cache-key");
+      tooltip.style("display", "none");
+      onRooflineLegendActivate(event, key);
+    });
+
+  const dotLayer = plotInner.append("g").attr("class", "dots");
+
+  const gx = g.append("g").attr("class", "axis x-axis").attr("transform", "translate(0," + ih + ")");
+  const gy = g.append("g").attr("class", "axis y-axis");
+
+  const xAxisTitleEl = g.append("text").attr("class", "axis-title").attr("text-anchor", "middle")
+    .attr("x", iw / 2).attr("y", ih + 44).text(meta.xAxisTitle);
+  const yAxisTitleEl = g.append("text").attr("class", "axis-title").attr("text-anchor", "middle")
+    .attr("transform", "rotate(-90)").attr("x", -ih / 2).attr("y", -62).text(meta.yAxisTitle);
+
+  const legW = 172;
+  const legH = 26 + cacheKeys.length * 16 + 10;
+  function legendTopY() { return ih - legH - 4; }
+  const legendG = g.append("g").attr("class", "legend-box").attr("transform", "translate(" + (iw - legW - 4) + "," + legendTopY() + ")");
+  legendG.append("rect").attr("class", "legend-bg").attr("width", legW).attr("height", legH).attr("rx", 5);
+  legendG.append("text").attr("class", "legend-title").attr("x", 8).attr("y", 16).text("Achievable peak (by memory)");
+  const legRows = legendG.selectAll("g.lrow").data(cacheKeys).enter().append("g")
+    .attr("class", "lrow")
+    .attr("transform", (d, i) => "translate(8," + (24 + i * 16) + ")");
+  legRows.append("line").attr("x1", 0).attr("x2", 28).attr("y1", 0).attr("y2", 0)
+    .attr("stroke", (d, i) => rooflineColorForIndex(i)).attr("class", "leg-line");
+  legRows.append("text").attr("class", "legend-row-label").attr("x", 34).attr("y", 4);
+
+  const kLeg = data.kernelLegend || [];
+  const kUl = document.getElementById("kernel-legend-list");
+  const kHead = document.getElementById("kernel-legend-heading");
+  const kClear = document.getElementById("kernel-legend-clear");
+  const rUl = document.getElementById("roofline-legend-list");
+  const rHead = document.getElementById("roofline-legend-heading");
+  const rClear = document.getElementById("roofline-legend-clear");
+  const selectedKernelNames = new Set();
+  const selectedRooflineKeys = new Set();
+  let roofHoverKernelName = null;
+  /** When Individual (dispatches) view: instruction-mix ceiling for the hovered dispatch (not kernel aggregate). */
+  let roofHoverDispatchComputePeak = null;
+  /** Kernel dispatch row currently showing the dot tooltip (for refresh after curved/linear toggle). */
+  let dotTooltipDatum = null;
+
+  function kernelFilterActive() {
+    return selectedKernelNames.size > 0;
+  }
+
+  function rooflineFilterActive() {
+    return selectedRooflineKeys.size > 0;
+  }
+
+  function effectiveComputePeak() {
+    if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
+      return roofHoverDispatchComputePeak;
+    }
+    let cp = meta.computePeak;
+    let mixName = null;
+    if (roofHoverKernelName != null) {
+      mixName = roofHoverKernelName;
+    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
+      mixName = Array.from(selectedKernelNames)[0];
+    }
+    if (mixName != null) {
+      const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[mixName];
+      if (kp != null && Number.isFinite(kp) && kp > 0) {
+        cp = kp;
+      }
+    }
+    return cp;
+  }
+
+  /** Matches effectiveComputePeak(): text for the flat compute roof P in tooltips (incl. HBM/LDS α model). */
+  function computeRoofFlatDisclaimer() {
+    if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
+      return "(Compute roof: instruction-mix ceiling for hovered dispatch.)";
+    }
+    let mixName = null;
+    if (roofHoverKernelName != null) {
+      mixName = roofHoverKernelName;
+    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
+      mixName = Array.from(selectedKernelNames)[0];
+    }
+    if (mixName != null) {
+      const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[mixName];
+      if (kp != null && Number.isFinite(kp) && kp > 0) {
+        if (roofHoverKernelName != null) {
+          return "(Compute roof: instruction-mix ceiling for hovered kernel.)";
+        }
+        return "(Compute roof: instruction-mix ceiling for selected kernel.)";
+      }
+    }
+    return "(Compute roof: FP32 FMA baseline, or kernel mix when hovered/selected.)";
+  }
+
+  function kernelHbmAlpha() {
+    let mixName = null;
+    if (roofHoverKernelName != null) {
+      mixName = roofHoverKernelName;
+    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
+      mixName = Array.from(selectedKernelNames)[0];
+    }
+    if (mixName != null && data.kernelHbmAlphaByName) {
+      const o = data.kernelHbmAlphaByName[mixName];
+      if (o != null && Number.isFinite(o.alpha)) {
+        return o;
+      }
+    }
+    return null;
+  }
+
+  function kernelLdsAlpha() {
+    let mixName = null;
+    if (roofHoverKernelName != null) {
+      mixName = roofHoverKernelName;
+    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
+      mixName = Array.from(selectedKernelNames)[0];
+    }
+    if (mixName != null && data.kernelLdsAlphaByName) {
+      const o = data.kernelLdsAlphaByName[mixName];
+      if (o != null && Number.isFinite(o.alpha)) {
+        return o;
+      }
+    }
+    return null;
+  }
+
+  function hbmAlphaForRoofline() {
+    const k = kernelHbmAlpha();
+    if (k != null) {
+      return k;
+    }
+    if (meta.useHbmAlphaModel === true && meta.defaultHbmAlphaFp32Fma != null && Number.isFinite(meta.defaultHbmAlphaFp32Fma)) {
+      return { alpha: meta.defaultHbmAlphaFp32Fma };
+    }
+    return null;
+  }
+
+  function ldsAlphaForRoofline() {
+    const k = kernelLdsAlpha();
+    if (k != null) {
+      return k;
+    }
+    if (meta.useLdsAlphaModel === true && meta.defaultLdsAlphaFp32Fma != null && Number.isFinite(meta.defaultLdsAlphaFp32Fma)) {
+      return { alpha: meta.defaultLdsAlphaFp32Fma };
+    }
+    return null;
+  }
+
+  function hbmRoofThroughput(x, bw, cp, alpha) {
+    const eps = 1e-30;
+    const xs = Math.max(x, eps);
+    if (!(bw > 0) || !(cp > 0)) {
+      return NaN;
+    }
+    const linear = Math.min(bw * xs, cp);
+    const a = Number(alpha);
+    if (!Number.isFinite(a)) {
+      return linear;
+    }
+    const invP = 1 / cp;
+    const invXb = 1 / (xs * bw);
+    const m = Math.min(invP, invXb);
+    const denom = invP + invXb - a * m;
+    if (!Number.isFinite(denom) || denom <= 1e-30) {
+      return linear;
+    }
+    const raw = 1 / denom;
+    if (!Number.isFinite(raw) || raw <= 0) {
+      return linear;
+    }
+    return raw;
+  }
+
+  function logspacePos(lo, hi, n) {
+    if (!(lo > 0) || !(hi > 0) || !isFinite(lo) || !isFinite(hi)) return [];
+    let a = lo;
+    let b = hi;
+    if (b < a) { const t = a; a = b; b = t; }
+    if (b <= a * (1 + 1e-15)) return [a];
+    const la = Math.log10(a);
+    const lb = Math.log10(b);
+    const steps = Math.max(2, Math.min(n | 0, 256));
+    const out = [];
+    for (let i = 0; i < steps; i++) {
+      const u = i / (steps - 1);
+      out.push(Math.pow(10, la + u * (lb - la)));
+    }
+    return out;
+  }
+
+  function rooflineXSamplesForView(xScale, bw, cp) {
+    const r = xScale.range();
+    const pLo = Math.min(r[0], r[1]);
+    const pHi = Math.max(r[0], r[1]);
+    let xLo = xScale.invert(pLo);
+    let xHi = xScale.invert(pHi);
+    const eps = 1e-300;
+    if (!(xLo > 0) || !isFinite(xLo)) xLo = eps;
+    if (!(xHi > 0) || !isFinite(xHi)) xHi = eps;
+    if (xHi < xLo) { const t = xLo; xLo = xHi; xHi = t; }
+    const xKnee = cp / bw;
+    const nSeg = 120;
+    const xsSet = new Set();
+    logspacePos(xLo, xHi, nSeg).forEach(v => xsSet.add(v));
+    xsSet.add(xLo);
+    xsSet.add(xHi);
+    if (xKnee > 0 && isFinite(xKnee) && xKnee > xLo && xKnee < xHi) xsSet.add(xKnee);
+    return Array.from(xsSet).filter(v => v > 0 && isFinite(v)).sort((a, b) => a - b);
+  }
+
+  function rooflinePointsForIndex(i, xScale) {
+    const rl = data.rooflines[i];
+    const key = rl.key != null ? rl.key : cacheKeys[i];
+    const bw = data.bandwidths[key];
+    const cp = effectiveComputePeak();
+    if (!rl || !rl.x) {
+      return [];
+    }
+    if (bw == null || !Number.isFinite(bw) || cp == null || !Number.isFinite(cp)) {
+      return rl.x.map((xv, j) => [xv, rl.y[j]]);
+    }
+    if (!(bw > 0) || !(cp > 0)) {
+      return rl.x.map((xv, j) => [xv, rl.y[j]]);
+    }
+    const curvedAlpha =
+      useCurvedHbmLdsRooflines && meta.useHbmAlphaModel === true && key === "HBM"
+        ? hbmAlphaForRoofline()
+        : useCurvedHbmLdsRooflines && meta.useLdsAlphaModel === true && key === "LDS"
+          ? ldsAlphaForRoofline()
+          : null;
+    if (curvedAlpha != null) {
+      const xs = rooflineXSamplesForView(xScale, bw, cp);
+      return xs.map(function(xv) {
+        return [xv, hbmRoofThroughput(xv, bw, cp, curvedAlpha.alpha)];
+      });
+    }
+    const xs = rooflineXSamplesForView(xScale, bw, cp);
+    return xs.map(xv => [xv, Math.min(bw * xv, cp)]);
+  }
+
+  function updateRooflinePaths(lineGen, xScale) {
+    roofGroup.selectAll(".roofline-path").each(function() {
+      const i = +d3.select(this).attr("data-idx");
+      const pts = rooflinePointsForIndex(i, xScale);
+      d3.select(this).datum(pts).attr("d", lineGen(pts));
+    });
+    roofGroup.selectAll(".roofline-hit").each(function() {
+      const i = +d3.select(this).attr("data-idx");
+      const pts = rooflinePointsForIndex(i, xScale);
+      d3.select(this).datum(pts).attr("d", lineGen(pts));
+    });
+  }
+
+  function updateKernelLegendUI() {
+    if (kHead) {
+      let t = "Kernels (" + kLeg.length + ")";
+      if (kernelFilterActive()) {
+        t += " — " + selectedKernelNames.size + " selected";
+      }
+      kHead.textContent = t;
+    }
+    if (kClear) kClear.hidden = !kernelFilterActive();
+    if (kUl) {
+      kUl.querySelectorAll("li").forEach(function(li) {
+        const name = li._kernelName;
+        if (!name) return;
+        const on = selectedKernelNames.has(name);
+        const active = kernelFilterActive();
+        li.classList.toggle("kernel-legend-selected", on);
+        li.classList.toggle("kernel-legend-dimmed", active && !on);
+      });
+    }
+  }
+
+  function updateRooflineLegendUI() {
+    if (rHead) {
+      let t = "Bandwidth rooflines (" + cacheKeys.length + ")";
+      if (rooflineFilterActive()) {
+        t += " — " + selectedRooflineKeys.size + " selected";
+      }
+      rHead.textContent = t;
+    }
+    if (rClear) rClear.hidden = !rooflineFilterActive();
+    if (rUl) {
+      rUl.querySelectorAll("li").forEach(function(li) {
+        const key = li._rooflineKey;
+        if (!key) return;
+        const on = selectedRooflineKeys.has(key);
+        const active = rooflineFilterActive();
+        li.classList.toggle("kernel-legend-selected", on);
+        li.classList.toggle("kernel-legend-dimmed", active && !on);
+      });
+    }
+  }
+
+  function onKernelLegendActivate(event, name) {
+    if (event.ctrlKey || event.metaKey) {
+      if (!kernelFilterActive()) {
+        kLeg.forEach(function(k) { selectedKernelNames.add(k.name); });
+        selectedKernelNames.delete(name);
+      } else if (selectedKernelNames.has(name)) {
+        selectedKernelNames.delete(name);
+      } else {
+        selectedKernelNames.add(name);
+      }
+    } else {
+      if (selectedKernelNames.size === 1 && selectedKernelNames.has(name)) {
+        selectedKernelNames.clear();
+      } else {
+        selectedKernelNames.clear();
+        selectedKernelNames.add(name);
+      }
+    }
+    updateKernelLegendUI();
+    redraw();
+  }
+
+  function onRooflineLegendActivate(event, key) {
+    if (event.ctrlKey || event.metaKey) {
+      if (!rooflineFilterActive()) {
+        cacheKeys.forEach(function(k) { selectedRooflineKeys.add(k); });
+        selectedRooflineKeys.delete(key);
+      } else if (selectedRooflineKeys.has(key)) {
+        selectedRooflineKeys.delete(key);
+      } else {
+        selectedRooflineKeys.add(key);
+      }
+    } else {
+      if (selectedRooflineKeys.size === 1 && selectedRooflineKeys.has(key)) {
+        selectedRooflineKeys.clear();
+      } else {
+        selectedRooflineKeys.clear();
+        selectedRooflineKeys.add(key);
+      }
+    }
+    updateRooflineLegendUI();
+    redraw();
+  }
+
+  kLeg.forEach(function(k) {
+    const li = document.createElement("li");
+    li._kernelName = k.name;
+    li.setAttribute("role", "listitem");
+    li.tabIndex = 0;
+    const sw = document.createElement("span");
+    sw.className = "kernel-swatch";
+    sw.style.backgroundColor = k.color;
+    sw.setAttribute("aria-hidden", "true");
+    const lab = document.createElement("span");
+    lab.className = "kernel-name";
+    lab.textContent = k.name;
+    lab.title = k.name;
+    const pct = document.createElement("span");
+    pct.className = "kernel-pct";
+    pct.textContent = (k.pct != null && Number.isFinite(k.pct)) ? (" " + k.pct.toFixed(2) + "%") : "";
+    li.appendChild(sw);
+    li.appendChild(lab);
+    li.appendChild(pct);
+    li.addEventListener("click", function(ev) {
+      onKernelLegendActivate(ev, k.name);
+    });
+    li.addEventListener("keydown", function(ev) {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        onKernelLegendActivate(ev, k.name);
+      }
+    });
+    kUl.appendChild(li);
+  });
+  updateKernelLegendUI();
+
+  if (kClear) {
+    kClear.addEventListener("click", function() {
+      selectedKernelNames.clear();
+      updateKernelLegendUI();
+      redraw();
+    });
+  }
+
+  if (rUl) {
+    cacheKeys.forEach(function(key) {
+      const li = document.createElement("li");
+      li._rooflineKey = key;
+      li.setAttribute("role", "listitem");
+      li.tabIndex = 0;
+      const sw = document.createElement("span");
+      sw.className = "roofline-swatch";
+      sw.style.backgroundColor = rooflineColorForKey(key);
+      sw.setAttribute("aria-hidden", "true");
+      const lab = document.createElement("span");
+      lab.className = "kernel-name";
+      lab.textContent = key;
+      lab.title = key;
+      li.appendChild(sw);
+      li.appendChild(lab);
+      li.addEventListener("click", function(ev) {
+        onRooflineLegendActivate(ev, key);
+      });
+      li.addEventListener("keydown", function(ev) {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          onRooflineLegendActivate(ev, key);
+        }
+      });
+      rUl.appendChild(li);
+    });
+  }
+  updateRooflineLegendUI();
+
+  if (rClear) {
+    rClear.addEventListener("click", function() {
+      selectedRooflineKeys.clear();
+      updateRooflineLegendUI();
+      redraw();
+    });
+  }
+
+  legRows.style("cursor", "pointer")
+    .on("click", function(event, d) {
+      onRooflineLegendActivate(event, d);
+    });
+
+  let thresholdIndex = 0;
+
+  const memSel = document.getElementById("memory-region-select");
+  cacheKeys.forEach((k, i) => {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = k;
+    memSel.appendChild(opt);
+  });
+  memSel.value = "0";
+
+  const viewSel = document.getElementById("view-type-select");
+  viewSel.value = "aggregate";
+
+  function currentMode() {
+    const r = +memSel.value;
+    const agg = viewSel.value === "aggregate";
+    return {
+      region: r,
+      aggregate: agg,
+      label: cacheKeys[r] + (agg ? " Agg" : "")
+    };
+  }
+
+  const th = data.thresholds;
+  const slider = document.getElementById("threshold-slider");
+  slider.min = "0";
+  slider.max = String(Math.max(0, th.length - 1));
+  slider.value = "0";
+  const thLabel = document.getElementById("threshold-label");
+
+  function isDarkTheme() {
+    return document.documentElement.classList.contains("theme-dark");
+  }
+  function syncThemeToggle() {
+    const btn = document.getElementById("btn-theme-toggle");
+    const dark = isDarkTheme();
+    btn.textContent = dark ? "Light mode" : "Dark mode";
+    btn.setAttribute("aria-pressed", String(dark));
+    btn.title = dark ? "Switch to light theme" : "Switch to dark theme";
+  }
+  function setTheme(dark) {
+    const root = document.documentElement;
+    root.classList.remove("theme-light", "theme-dark");
+    root.classList.add(dark ? "theme-dark" : "theme-light");
+    syncThemeToggle();
+  }
+  document.getElementById("btn-theme-toggle").addEventListener("click", () => setTheme(!isDarkTheme()));
+  syncThemeToggle();
+
+  (function setupHbmLdsRooflineToggle() {
+    const btn = document.getElementById("btn-hbm-lds-roofline-toggle");
+    if (!btn) return;
+    function hbmLdsAlphaModelsActive() {
+      return meta.useHbmAlphaModel === true || meta.useLdsAlphaModel === true;
+    }
+    function syncHbmLdsRooflineToggle() {
+      const on = hbmLdsAlphaModelsActive();
+      btn.hidden = !on;
+      if (!on) return;
+      btn.setAttribute("aria-pressed", String(useCurvedHbmLdsRooflines));
+      btn.textContent = "Toggle curved rooflines";
+      btn.title = useCurvedHbmLdsRooflines
+        ? "Use piecewise-linear roofs (min(AI×bandwidth, compute)) for HBM and LDS"
+        : "Use α-blended curved roofs for HBM and LDS";
+    }
+    btn.addEventListener("click", function() {
+      if (!hbmLdsAlphaModelsActive()) return;
+      useCurvedHbmLdsRooflines = !useCurvedHbmLdsRooflines;
+      syncHbmLdsRooflineToggle();
+      redraw();
+    });
+    syncHbmLdsRooflineToggle();
+  })();
+
+  function regionKey() { return cacheKeys[currentMode().region]; }
+
+  function visibleDataset() {
+    const t = th[thresholdIndex];
+    const key = regionKey();
+    const agg = currentMode().aggregate;
+    const src = agg ? data.aggregate : data.dispatch;
+    return src.filter(d => {
+      const c = d.cumulativePct;
+      if (c == null || !Number.isFinite(c) || c > t) return false;
+      if (kernelFilterActive() && !selectedKernelNames.has(d.kernelName)) return false;
+      const a = d.ai[key];
+      if (a == null || !(a > 0) || !Number.isFinite(a)) return false;
+      const tp = d.throughput;
+      if (tp == null || !(tp > 0) || !Number.isFinite(tp)) return false;
+      return true;
+    });
+  }
+
+  function updateRooflineWidths() {
+    const r = currentMode().region;
+    const filterOn = rooflineFilterActive();
+    roofGroup.selectAll(".roofline-path").each(function() {
+      const idx = +d3.select(this).attr("data-idx");
+      const key = cacheKeys[idx];
+      const inSel = !filterOn || selectedRooflineKeys.has(key);
+      const baseW = idx === r ? 3 : 1;
+      const sel = d3.select(this);
+      if (!inSel) {
+        sel.attr("stroke-width", 1).attr("opacity", 0.18);
+      } else {
+        sel.attr("stroke-width", baseW).attr("opacity", 1);
+      }
+    });
+    roofGroup.selectAll(".roofline-hit").each(function() {
+      const idx = +d3.select(this).attr("data-idx");
+      const key = cacheKeys[idx];
+      const inSel = !filterOn || selectedRooflineKeys.has(key);
+      d3.select(this).attr("pointer-events", inSel ? "stroke" : "none");
+    });
+  }
+
+  function updateLegend() {
+    const r = currentMode().region;
+    const filterOn = rooflineFilterActive();
+    legendG.selectAll("g.lrow").each(function(d, i) {
+      const key = d;
+      const inSel = !filterOn || selectedRooflineKeys.has(key);
+      const line = d3.select(this).select("line");
+      const text = d3.select(this).select("text");
+      if (!inSel) {
+        line.attr("stroke-width", 1).attr("opacity", 0.35);
+        text.attr("opacity", 0.45);
+      } else {
+        line.attr("opacity", 1).attr("stroke-width", i === r ? 3 : 1);
+        text.attr("opacity", 1);
+      }
+      text.text(d + (i === r ? " (AI axis)" : ""));
+    });
+    let personalTitle = false;
+    if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
+      personalTitle = true;
+    } else if (roofHoverKernelName != null) {
+      const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[roofHoverKernelName];
+      personalTitle = kp != null && Number.isFinite(kp) && kp > 0;
+    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
+      const n = Array.from(selectedKernelNames)[0];
+      const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[n];
+      personalTitle = kp != null && Number.isFinite(kp) && kp > 0;
+    }
+    legendG.select(".legend-title").text(
+      personalTitle ? "Achievable peak (instruction-mix roof)" : "Achievable peak (by memory)"
+    );
+  }
+
+  /** Peak at kernel AI matching chart rooflines: curved (PEAK) vs linear linear HBM/LDS (PEAK_LINEAR). */
+  function tooltipPeakForDot(d) {
+    const alphaCharts =
+      meta.useHbmAlphaModel === true || meta.useLdsAlphaModel === true;
+    if (alphaCharts && !useCurvedHbmLdsRooflines) {
+      const pl = d.peakLinear;
+      if (pl != null && Number.isFinite(pl)) {
+        return pl;
+      }
+    }
+    return d.peak;
+  }
+
+  function tooltipHtml(d) {
+    const key = d.memRegion || regionKey();
+    const rawAi = d.ai[key];
+    const aiVal = rawAi != null && Number.isFinite(rawAi) ? rawAi : "N/A";
+    const pctRoof = d.percentAchieved != null && Number.isFinite(d.percentAchieved)
+      ? d.percentAchieved.toFixed(4) + " %"
+      : "N/A";
+    const aiLabel = d.memRegion ? ("AI (" + d.memRegion + "): ") : "AI: ";
+    const m = currentMode();
+    const nl = String.fromCharCode(10);
+    const peakStr = tooltipPeakForDot(d).toFixed(3);
+    const lines = m.aggregate ? [
+      "Name: " + d.nameDisplay,
+      aiLabel + aiVal,
+      "Achieved throughput: " + d.throughput.toFixed(3) + " GFLOPs/s",
+      "Peak throughput: " + d.peak.toFixed(3) + " GFLOPs/s",
+      "Percent of roofline achieved: " + pctRoof,
+      "Performance limiter: " + d.limiter,
+      "Total dispatches: " + d.count,
+      "Aggregate percent runtime: " + d.percentage.toFixed(5) + " %"
+    ] : [
+      "Name: " + d.nameDisplay,
+      "Index: " + d.index + " / " + d.totalKernels,
+      aiLabel + aiVal,
+      "Achieved throughput: " + d.throughput.toFixed(3) + " GFLOPs/s",
+      "Peak throughput: " + d.peak.toFixed(3) + " GFLOPs/s",
+      "Percent of roofline achieved: " + pctRoof,
+      "Performance limiter: " + d.limiter,
+      "Aggregate percent runtime: " + d.percentageAggregate.toFixed(5) + " %",
+      "Individual percent runtime: " + d.percentage.toFixed(5) + " %"
+    ];
+    return lines.join(nl);
+  }
+
+  function refreshDotTooltipIfNeeded() {
+    if (dotTooltipDatum != null) {
+      tooltip.text(tooltipHtml(dotTooltipDatum));
+    }
+  }
+
+  function refreshRooflinesForDotHover() {
+    const { x, y } = currentScales();
+    const lineGen = d3.line()
+      .defined(d => d[0] > 0 && d[1] > 0 && isFinite(d[0]) && isFinite(d[1]))
+      .x(d => x(d[0])).y(d => y(d[1]))
+      .curve(d3.curveLinear);
+    updateRooflinePaths(lineGen, x);
+    updateRooflineWidths();
+    updateLegend();
+  }
+
+  function computeDotData() {
+    const singleKernelSelected = kernelFilterActive() && selectedKernelNames.size === 1;
+    if (!singleKernelSelected) {
+      return visibleDataset().map(d => Object.assign({}, d, { memRegion: null, dotColor: d.color }));
+    }
+    const t = th[thresholdIndex];
+    const agg = currentMode().aggregate;
+    const src = agg ? data.aggregate : data.dispatch;
+    const expanded = [];
+    src.forEach(function(d) {
+      const c = d.cumulativePct;
+      if (c == null || !Number.isFinite(c) || c > t) return;
+      if (!selectedKernelNames.has(d.kernelName)) return;
+      const tp = d.throughput;
+      if (tp == null || !(tp > 0) || !Number.isFinite(tp)) return;
+      cacheKeys.forEach(function(memKey) {
+        const a = d.ai[memKey];
+        if (a == null || !(a > 0) || !Number.isFinite(a)) return;
+        expanded.push(Object.assign({}, d, {
+          id: d.id + "||" + memKey,
+          memRegion: memKey,
+          dotColor: rooflineColorForKey(memKey),
+        }));
+      });
+    });
+    return expanded;
+  }
+
+  function drawDots(xFn, yFn) {
+    const pts = computeDotData();
+    const key = regionKey();
+    const sel = dotLayer.selectAll("circle.dot").data(pts, d => d.id);
+    sel.enter().append("circle")
+      .attr("class", "dot")
+      .attr("r", 4)
+      .style("cursor", "pointer")
+      .merge(sel)
+      .attr("cx", d => xFn(d.ai[d.memRegion || key]))
+      .attr("cy", d => yFn(d.throughput))
+      .attr("fill", d => d.dotColor || d.color)
+      .on("click", function(event, d) {
+        event.stopPropagation();
+        roofHoverKernelName = null;
+        dotTooltipDatum = null;
+        roofHoverDispatchComputePeak = null;
+        tooltip.style("display", "none");
+        onKernelLegendActivate(event, d.kernelName);
+      })
+      .on("mouseenter", function(event, d) {
+        roofHoverKernelName = d.kernelName;
+        dotTooltipDatum = d;
+        if (!currentMode().aggregate && d.kernelComputePeak != null && Number.isFinite(d.kernelComputePeak) && d.kernelComputePeak > 0) {
+          roofHoverDispatchComputePeak = d.kernelComputePeak;
+        } else {
+          roofHoverDispatchComputePeak = null;
+        }
+        refreshRooflinesForDotHover();
+        tooltip.style("display", "block").text(tooltipHtml(d));
+      })
+      .on("mousemove", function(event) {
+        tooltip.style("left", (event.clientX + 14) + "px").style("top", (event.clientY + 14) + "px");
+      })
+      .on("mouseleave", function() {
+        roofHoverKernelName = null;
+        dotTooltipDatum = null;
+        roofHoverDispatchComputePeak = null;
+        refreshRooflinesForDotHover();
+        tooltip.style("display", "none");
+      });
+    sel.exit().remove();
+  }
+
+  function updateThresholdLabel() {
+    thLabel.textContent = th[thresholdIndex].toFixed(3) + "%";
+  }
+
+  function applyView() {
+    const { x, y } = currentScales();
+    gx.call(d3.axisBottom(x).ticks(8, "~s"));
+    gy.call(d3.axisLeft(y).ticks(8, "~s"));
+    xGridG.attr("transform", "translate(0," + ih + ")")
+      .call(d3.axisBottom(x).ticks(8, "~s").tickSize(-ih).tickFormat(""))
+      .call(z => z.select(".domain").remove());
+    yGridG.call(d3.axisLeft(y).ticks(8, "~s").tickSize(-iw).tickFormat(""))
+      .call(z => z.select(".domain").remove());
+
+    const lineGen = d3.line()
+      .defined(d => d[0] > 0 && d[1] > 0 && isFinite(d[0]) && isFinite(d[1]))
+      .x(d => x(d[0])).y(d => y(d[1]))
+      .curve(d3.curveLinear);
+    updateRooflinePaths(lineGen, x);
+
+    updateRooflineWidths();
+    drawDots(x, y);
+    updateLegend();
+    updateThresholdLabel();
+    refreshDotTooltipIfNeeded();
+  }
+
+  function redraw() {
+    const { x, y } = currentScales();
+    const lineGen = d3.line()
+      .defined(d => d[0] > 0 && d[1] > 0 && isFinite(d[0]) && isFinite(d[1]))
+      .x(d => x(d[0])).y(d => y(d[1]))
+      .curve(d3.curveLinear);
+    updateRooflinePaths(lineGen, x);
+    updateRooflineWidths();
+    const m = currentMode();
+    disc.style.display = (!m.aggregate && meta.disclaimer) ? "block" : "none";
+    drawDots(x, y);
+    updateLegend();
+    updateThresholdLabel();
+    refreshDotTooltipIfNeeded();
+  }
+
+  const zoom = d3.zoom()
+    .scaleExtent([0.12, 100])
+    .extent([[margin.left, margin.top], [margin.left + iw, margin.top + ih]])
+    .on("zoom", (event) => {
+      transform = event.transform;
+      applyView();
+    });
+
+  const chartWrapEl = document.getElementById("chart-wrap");
+  let lastLayoutW = -1;
+  let lastLayoutH = -1;
+
+  function layoutChart() {
+    let nw = chartWrapEl.clientWidth;
+    let nh = chartWrapEl.clientHeight;
+    if (nw < 100) nw = Math.min(960, Math.max(400, window.innerWidth - 48));
+    if (nh < 100) nh = Math.min(640, Math.max(320, window.innerHeight - 220));
+    if (nw === lastLayoutW && nh === lastLayoutH) return;
+    lastLayoutW = nw;
+    lastLayoutH = nh;
+    W = Math.max(280, nw);
+    H = Math.max(240, nh);
+    iw = W - margin.left - margin.right;
+    ih = H - margin.top - margin.bottom;
+    x0.range([0, iw]);
+    y0.range([ih, 0]);
+    svg.attr("width", W).attr("height", H).attr("viewBox", "0 0 " + W + " " + H);
+    clipRect.attr("width", iw).attr("height", ih);
+    gx.attr("transform", "translate(0," + ih + ")");
+    xAxisTitleEl.attr("x", iw / 2).attr("y", ih + 44);
+    yAxisTitleEl.attr("x", -ih / 2);
+    legendG.attr("transform", "translate(" + (iw - legW - 4) + "," + legendTopY() + ")");
+    zoom.extent([[margin.left, margin.top], [margin.left + iw, margin.top + ih]]);
+    transform = d3.zoomIdentity;
+    svg.call(zoom);
+    applyView();
+  }
+
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(function() { layoutChart(); }).observe(chartWrapEl);
+  } else {
+    window.addEventListener("resize", layoutChart);
+  }
+  requestAnimationFrame(layoutChart);
+
+  function resetZoom() {
+    svg.transition().duration(200).call(zoom.transform, d3.zoomIdentity);
+  }
+
+  document.getElementById("btn-reset-zoom").addEventListener("click", resetZoom);
+  g.on("dblclick", function(event) {
+    event.preventDefault();
+    resetZoom();
+  });
+
+  function onViewControlsChange() {
+    redraw();
+  }
+  memSel.addEventListener("change", onViewControlsChange);
+  viewSel.addEventListener("change", onViewControlsChange);
+  slider.addEventListener("input", () => {
+    thresholdIndex = +slider.value;
+    redraw();
+  });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def extract(
+    counter,
+    results,
+    sig_runtime,
+    plot,
+    dump,
+    arch=None,
+    base_name=None,
+    output_stem=None,
+):
+    """output_stem: if set (e.g. --directory mode), HTML/CSV outputs use this path prefix (no extension)."""
+    if isinstance(counter, str):
+        last_dot = counter.rfind(".")
+        file_stem = counter[:last_dot] if last_dot >= 0 else counter
+        roofCountFilename = file_stem
+        df_roof = pd.read_csv(counter)
+    elif isinstance(counter, pd.DataFrame):
+        if output_stem is not None:
+            file_stem = output_stem
+            roofCountFilename = Path(output_stem).name
+        else:
+            file_stem = base_name or "combined"
+            roofCountFilename = file_stem
+        df_roof = counter
+    else:
+        raise TypeError("counter must be a file path (str) or pandas DataFrame")
+
+    sigRuntime = sig_runtime
+
+    # Load roof counters into pandas df (if not already a DataFrame)
+
+
+    # Check if empty
+    if df_roof.empty:
+        print('Input roof counters file is empty')
+        quit()
+    # Check for wrong file
+    if "CompleteNs" in df_roof.columns:
+        print('Error: "results.csv" log file submitted with "-c" flag, which is for "roof-counters.csv" log file')
         quit()
 
-    # Trim whitespace from the ends of column labels
-    df_hw = df_hw.rename(columns={col: col.strip() for col in df_hw.columns})
-    # Make name consistent with other dataframes
-    df_hw.rename(columns={'Label':'KernelName'}, inplace=True)
-    df_hw['KernelName'] = df_hw['KernelName'].str.strip()
+    # Check for 'None' values and remove them
+    total_omitted_kernels_round_1 = max(df_roof[(df_roof.isnull()).any(axis=1)]['Dispatch_Id'].unique().size, df_roof[(df_roof == 'None').any(axis=1)]['Dispatch_Id'].unique().size)
+    total_kernels = df_roof["Dispatch_Id"].unique().size
 
-    # Names of labels from hw_metrics.csv
-    maxSocketTemp = 'Max Socket Temp (C)'
-    maxVRTemp = 'Max VR Temp (C)'
-    maxHBMTemp = 'Max HBM Temp (C)'
-    socketPower = 'Socket Power (W)'
-    uclk = 'Effective UCLK Frequency (Mhz)'
-    gfx2 = 'XCC2 Effective GFXCLK Frequency (MHz)'
-    gfx3 = 'XCC3 Effective GFXCLK Frequency (MHz)'
-    gfx4 = 'XCC4 Effective GFXCLK Frequency (MHz)'
-    gfx5 = 'XCC5 Effective GFXCLK Frequency (MHz)'
-    gfx6 = 'XCC6 Effective GFXCLK Frequency (MHz)'
-    gfx7 = 'XCC7 Effective GFXCLK Frequency (MHz)'
-    cols=[maxSocketTemp, maxVRTemp, maxHBMTemp, socketPower, uclk, gfx2, gfx3, gfx4, gfx5, gfx6, gfx7]
+    if total_omitted_kernels_round_1 > 0:
+        print(f'WARNING: {total_omitted_kernels_round_1}/{total_kernels} kernels can\'t be analyzed due to non-deterministic runs during counter collection. Attempting to continue without them.')
+        df_roof = df_roof[~(df_roof == 'None').any(axis=1)]
+        df_roof = df_roof[~(df_roof.isnull()).any(axis=1)]
 
-    # Calculate graphics clock mean and max across all chiplets
-    df_hw['GFX mean'] = df_hw[[gfx2, gfx3, gfx4, gfx5, gfx6, gfx7]].mean(axis=1)
-    df_hw['GFX max'] = df_hw[[gfx2, gfx3, gfx4, gfx5, gfx6, gfx7]].max(axis=1)
+    # If no arch specified, guess
+    if (arch == None) & (df_roof.keys().str.contains('TCC_BUBBLE').sum() > 0):
+        arch = 'MI300X'
+    elif arch == None:
+        arch = 'MI250X'
 
-    # Gather statistics
-    mins = (df_hw.groupby('KernelName')[cols].min())
-    mins.columns = [col + ' min' for col in mins.columns]
-    mins.reset_index(inplace=True)
-    maxes = (df_hw.groupby('KernelName')[cols].max())
-    maxes.columns = [col + ' max' for col in maxes.columns]
-    maxes.reset_index(inplace=True)
-    means = (df_hw.groupby('KernelName')[cols].mean())
-    means.columns = [col + ' mean' for col in means.columns]
-    means.reset_index(inplace=True)
-    stdevs = (df_hw.groupby('KernelName')[cols].std())
-    stdevs.columns = [col + ' stdev' for col in stdevs.columns]
-    stdevs.reset_index(inplace=True)
+    df_roof = convert_columns_to_int(df_roof)
+    df_roof = compute_flops(df_roof, arch)  # Compute AI's for each kernel dispatch
 
-    # Merge telemetry statistics into main dataframe (keeping kernels that don't have telemetry data)
-    df = pd.merge(df, mins, on='KernelName', how='left')
-    df = pd.merge(df, maxes, on='KernelName', how='left')
-    df = pd.merge(df, means, on='KernelName', how='left')
-    df = pd.merge(df, stdevs, on='KernelName', how='left')
+    # Check for rocprofv3 and convert to v1 format
+    if 'Agent_Id' in df_roof.columns:
+        df_roof = df_roof.rename(columns={'Dispatch_Id':'Index'})
+        df_roof = df_roof.rename(columns={'Kernel_Name':'KernelName'})
 
-df.set_index('KernelName', inplace=True)
-
-
-
-# Plot power, temperature, clocks
-if args.plot and args.hw_metrics != None:
-    ## Convert timestamp column to datetime format
-    df_hw['Timestamp'] = pd.to_datetime(df_hw['Timestamp'], unit='ns')
-
-    # Create two subplots stacked vertically, set size
-    fig, host = plt.subplots(2, sharex=True, figsize=(21,12))
-    fig.suptitle('Achieved/Peak Throughput and Telemetry Data', fontsize=24)  # Set title
-    plt.grid(True)  # Turn on gridlines
-    fig.subplots_adjust(right=0.75)  # New axes appear on the right
-
-    ## Plot telemetry
-    ### Clock axis
-    host[1].scatter(df_hw['Timestamp'], df_hw[gfx2], color='blue', label="GFX Clock", s=2, marker='.')  # Create a scatter plot
-    host[1].scatter(df_hw['Timestamp'], df_hw[uclk], color='cyan', label="Memory Clock", s=2, marker='.')  # Create a scatter plot
-    host[1].set_xlabel('Timestamp')  # Set x-axis label
-    host[1].set_ylabel('Clock Frequency (MHz)', color='blue')  # Set y-axis label
-    host[1].tick_params(axis='y', colors='blue')
-
-    ### Power axis
-    power_axis = host[1].twinx()
-    power_axis.scatter(df_hw['Timestamp'], df_hw[socketPower], color='green', label="Power", s=2, marker='.')  # Create a scatter plot
-    power_axis.set_xlabel('Timestamp')  # Set x-axis label
-    power_axis.set_ylabel('Socket Power (W)', color='green')  # Set y-axis label
-    power_axis.tick_params(axis='y', colors='green')
-    plt.axhline(550, color='green', linestyle='dashed')
-
-    ### Temperature axis
-    temp_axis = host[1].twinx()
-    temp_axis.spines["right"].set_position(("axes", 1.04))
-    temp_axis.scatter(df_hw['Timestamp'], df_hw[maxSocketTemp], color='red', label="Socket Temp", s=2, marker='.')  # Create a scatter plot
-    temp_axis.set_xlabel('Timestamp')  # Set x-axis label
-    temp_axis.set_ylabel('Temperature (C)', color='red')  # Set y-axis label
-    temp_axis.tick_params(axis='y', colors='red')
-
-
-    ## Plot achieved vs. peak throughput
-    ### Calculate totals of operation types
-    df_roof['TOT_ADD'] = df_roof['SQ_INSTS_VALU_ADD_F16'] + df_roof['SQ_INSTS_VALU_ADD_F32'] + df_roof['SQ_INSTS_VALU_ADD_F64']
-    df_roof['TOT_MUL'] = df_roof['SQ_INSTS_VALU_MUL_F16'] + df_roof['SQ_INSTS_VALU_MUL_F32'] + df_roof['SQ_INSTS_VALU_MUL_F64']
-    df_roof['TOT_TRANS'] = df_roof['SQ_INSTS_VALU_TRANS_F16'] + df_roof['SQ_INSTS_VALU_TRANS_F32'] + df_roof['SQ_INSTS_VALU_TRANS_F64']
-    df_roof['TOT_FMA'] = df_roof['SQ_INSTS_VALU_FMA_F16'] + df_roof['SQ_INSTS_VALU_FMA_F32'] + df_roof['SQ_INSTS_VALU_FMA_F64']
-    df_roof['TOT_VALU'] = df_roof['TOT_ADD'] + df_roof['TOT_MUL'] + df_roof['TOT_FMA'] + df_roof['TOT_TRANS']
-    df_roof['FLOP_FACTOR'] = ((128 * (df_roof['TOT_ADD'] + df_roof['TOT_MUL'] + df_roof['TOT_TRANS'])) + (256 * df_roof['TOT_FMA'])) / df_roof['TOT_VALU']
-
-    ### Get timing info from rocprof
-    df_roof = pd.merge(df_roof, df_runtime[['Index', 'DurationNs']], on='Index')
-
-    ### Calculate achieved and peak
-    df_roof['ACHIEVED'] = df_roof['TOTAL_OPS'] / df_roof['DurationNs']
-    df_roof.rename(columns={'Index': 'Instance Index'}, inplace=True)
-    df_roof = pd.merge(df_roof, df_hw.groupby('Instance Index')['GFX max'].max(), on='Instance Index')
-    df_roof['PEAK'] = pd.DataFrame({"compute":df_roof['GFX max']/1000*numCUs*df_roof['FLOP_FACTOR'], "memory":peakBandwidth*df_roof['AI_HBM_TOT']}).min(axis=1)
-    df_hw = pd.merge(df_hw, df_roof[['Instance Index', 'ACHIEVED']], on='Instance Index')
-    df_hw = pd.merge(df_hw, df_roof[['Instance Index', 'PEAK']], on='Instance Index')
-
-    ### Plot
-    host[0].scatter(df_hw['Timestamp'], df_hw['PEAK'], label="Peak Achievable Flops", marker='.', color='b')
-    host[0].scatter(df_hw['Timestamp'], df_hw['ACHIEVED'], label="Flops Achieved", marker='.', color='orange')
-    host[0].set_ylabel('Throughput (GFlops/s)')
-    host[0].grid(True)
-    host[0].set_ylim(bottom=0)
-
-    ### Add legend
-    legend_elements = [Line2D([0], [0], color='b', lw=1, label='GFX Clock'),
-                       Line2D([0], [0], color='c', lw=1, label='Memory Clock'),
-                       Line2D([0], [0], color='g', lw=1, label='Power'),
-                       Line2D([0], [0], color='g', lw=1, linestyle='dashed', label='Power Limit'),
-                       Line2D([0], [0], color='r', lw=1, label='Socket Temp')]
-    host[1].legend(handles=legend_elements, loc='best')
-
-    legend_elements = [Line2D([0], [0], color='b', lw=2, label='Theoretical Peak Flops'),
-                       Line2D([0], [0], color='orange', lw=2, label='Flops Achieved')]
-    host[0].legend(handles=legend_elements, loc='best')
-
-    ## Save and close plot
-    fig.tight_layout()
-    plt.savefig(hwFilename + '_plot.png')
-    plt.close()
-
-
-# Prepare for analysis
-df = df.sort_values(by='Percentage', ascending=False)
-df_peaks = df[['HBM_BW_PEAK','L2_BW_PEAK','vL1d_BW_PEAK','LDS_BW_PEAK','COMPUTE_PEAK']]
-if df.keys().str.contains('TCC_BUBBLE').sum() > 0:
-    arch = "MI300x"
-else:
-    arch = "MI250"
-df['LIMITER'] = df_peaks.where(df_peaks > 0).idxmin(axis=1).str[:-5] + " (" + arch + ")"
-df['Throughput'] = df['TOTAL_OPS'] / df['AverageNs']
-df['PercentAchieved'] = df['Throughput'] / df['PEAK'] * 100
-
-# Guided analysis
-print(f"Total unique kernels: {len(df)}")
-print(f"Total kernel dispatches: {len(df_roof)}")
-for index, row in df.iterrows():  # loop through each kernel 
-    if row['Percentage'] < sigRuntime:
-        continue
-    print("\n" + index)
-    print(f"  Total operations per dispatch:", "{:e}".format(row['TOTAL_OPS']), "ops")
-    print(f"  Average runtime per dispatch: ", "{:e}".format(row['AverageNs']), "ns")
-    print(f"  Total contribution to runtime: {round(row['Percentage'], 3)} %")
-    print(f"  Total dispatches:              {int(row['Count'])}")
-
-    print(f"\n  Arithmetic intensity (HBM):  ", round(row['AI_HBM_TOT'], 4))
-    print(f"  Arithmetic intensity (L2):   ", round(row['AI_L2_TOT'], 4))
-    print(f"  Arithmetic intensity (L1):   ", round(row['AI_vL1d_TOT'], 4))
-    print(f"  Arithmetic intensity (LDS):  ", round(row['AI_LDS_TOT'], 4))
-
-    print(f"\n  Performance limiter:         ", row['LIMITER'])
-    print(f"  Peak achievable throughput:  ", round(row['PEAK'], 2), "GFLOPS/s")
-    print(f"  Percent of peak achieved:    ", round(row['PercentAchieved'], 4), "%")
-
-    # Calculate achieved
-    print(f"\n  Achieved throughput:         ", round(row['Throughput'], 2), "GFLOPS/s")
-
-    # Calulate peak
-    if args.hw_metrics != None:
-        totalAdd = row['SQ_INSTS_VALU_ADD_F16'] + row['SQ_INSTS_VALU_ADD_F32'] + row['SQ_INSTS_VALU_ADD_F64']
-        totalMul = row['SQ_INSTS_VALU_MUL_F16'] + row['SQ_INSTS_VALU_MUL_F32'] + row['SQ_INSTS_VALU_MUL_F64']
-        totalTrans = row['SQ_INSTS_VALU_TRANS_F16'] + row['SQ_INSTS_VALU_TRANS_F32'] + row['SQ_INSTS_VALU_TRANS_F64']
-        totalFMA = row['SQ_INSTS_VALU_FMA_F16'] + row['SQ_INSTS_VALU_FMA_F32'] + row['SQ_INSTS_VALU_FMA_F64']
-        totalOps = totalAdd + totalMul + totalTrans + totalFMA
-        flopFactor = ((128 * (totalAdd + totalMul + totalTrans)) + (256 * totalFMA)) / totalOps
-
-        if row[gfx2 + ' mean']/1000*numCUs*flopFactor < peakBandwidth*row['AI_HBM_TOT']:  # Compute bound
-            print("\n  This kernel is compute bound.")
-            peak = row[gfx2 + ' mean']/1000*numCUs*flopFactor
-            print(f"  Peak achievable (using mean graphics counter):", round(peak, 2), "GFLOPS/s")
-            percentAchieved = achieved / peak * 100
-            print(f"  Percent achieved (using mean graphics counter):", round(percentAchieved, 3), "%")
-            print(f"  Peak achievable (using max graphics counter): ", round(row[gfx2 + ' max']/1000*numCUs*flopFactor, 2), "GFLOPS/s")
-            print(f"  Percent achieved (using max graphics counter):", round(100 * achieved / (row[(gfx2 + " max")]/1000*numCUs*flopFactor), 3), "%")
-        else:  # Memory bound
-            print("\n  This kernel is memory bound.")
-            peak = peakBandwidth*row['AI_HBM_TOT']
-            print(f"  Peak achievable:    ", round(peak, 2), "GFLOPS/s")
-            percentAchieved = achieved / peak * 100
-            print(f"  Percent achieved:   ", round(percentAchieved, 3), "%")
-
-    # Troubleshooting bad kernels
-    if args.hw_metrics != None:
-        #if percentAchieved < 90:  # 90% threshold
-        # Check if graphics clock is being throttled
-        print(f"\n  Graphics counter peak:", round(row[gfx2 + ' max'], 2), "MHz")
-        print(f"  Graphics counter mean:", round(row[gfx2 + ' mean'], 2), "MHz")
-        if (row[gfx2 + " max"] < 2000):
-            print("  Graphics counter is not reaching its peak (~2,000 MHz)")
-
-        # Check power first
-        print(f"\n  Power max: ", round(row[socketPower + " max"], 2), "W")
-        print(f"  Power mean:", round(row[socketPower + " mean"], 2), "W")
-        if row[socketPower + " max"] > 549:
-            print("  The graphics counter is likely being throttled by power.")
-        else:
-            print("  Not throttled by power")
-
-        # Check socket temp
-        print(f"\n  Socket temp mean:", round(row[maxSocketTemp + " mean"],2), "C")
-        print(f"  Socket temp max: ", round(row[maxSocketTemp + " max"],2), "C")
-
-        # Check HBM temp
-        print(f"\n  HBM temp mean:", round(row[maxHBMTemp + " mean"], 2), "C")
-        print(f"  HBM temp max: ", round(row[maxHBMTemp + " max"], 2), "C")
-
-
-print(f"\n{insigKernels} kernels omitted for having less than {sigRuntime} percent runtime (use --sig-runtime to change threshold)")
-print()
-
-df_roof['Percentage'] = df_roof['DurationNs']/sum(totalRuntimes) * 100
-df_roof['Throughput'] = df_roof['TOTAL_OPS'] / df_roof['DurationNs']
-df_roof['PercentAchieved'] = df_roof['Throughput'] / df_roof['PEAK'] * 100
-df_roof = df_roof.rename(columns={'KernelName_x':'KernelName'}).merge(df['Percentage'],on='KernelName')
-df_roof = df_roof.rename(columns={'Percentage_x':'Percentage'})
-df_roof = df_roof.rename(columns={'Percentage_y':'PercentageAggregate'})
-
-# Interactive roofline plot
-if args.plot:
-    df_plot = df_roof
-    df_plot['TotalKernels'] = len(df_plot)  # Saving in this format to pass to tooltip
-
-    # Maximum number of kernel dispatches to plot (browser slows down with more)
-    n_samples = 50000
-
-    if len(df_plot) > n_samples:
-        df_plot.sort_values('Index')
-        df_plot = df_plot.iloc[::len(df_plot) // n_samples]
-        n_samples = len(df_plot)  # Adjust for remainder
-
-    # Sort the data by significance
-    df_plot = df_plot.sort_values(by='PercentageAggregate', ascending=False)
-
-    # Assign a unique color to each name
-    color_map = px.colors.qualitative.Plotly
-    name_to_color = {name: color_map[i % len(color_map)] for i, name in enumerate(df.index)}
-    df_plot['color'] = [name_to_color[name] for name in df_plot['KernelName']]
-    df['color'] = [name_to_color[name] for name in df.index]
-
-    # Compute the range for the plot
-    x_min = 0.001
-    x_max = 100000
-    y_min = 0.5
-    y_max = 200000
-
-    # Get x-values for lines
-    x_vals = np.logspace(np.log10(x_min), np.log10(x_max), 200)
-    # Add a point for each spot a bandwidth line intersects the compute line
-    x_vals = np.sort(np.append(x_vals, [compute_peaks[arch] / caches[arch][cache] for cache in caches[arch] for arch in caches]))
-
-    # MI250 Roofline
-    mi250x_lines = [
-        go.Scatter(
-            x=x_vals,
-            y=np.minimum(caches['MI250'][key] * x_vals, compute_peaks['MI250']),
-            visible=True,
-            mode='lines',
-            name=f'MI250X {key} Achievable Peak',
-            line=dict(color=color_map[0], dash='solid')
-        )
-        for key in caches['MI250'].keys()
-    ]
-    # MI300a Roofline
-    mi300a_lines = [go.Scatter(
-            x=x_vals,
-            y=np.minimum(caches['MI300A'][key] * x_vals, compute_peaks['MI300A']),
-            visible=True,
-            mode='lines',
-            name=f'MI300A {key} Achievable Peak',
-            line=dict(color=color_map[0], dash='solid')
-        )
-        for key in caches['MI300A'].keys()
-    ]
-    # MI300x Roofline
-    mi300x_lines = [go.Scatter(
-            x=x_vals,
-            y=np.minimum(caches['MI300x'][key] * x_vals, compute_peaks['MI300x']),
-            visible=True,
-            mode='lines',
-            name=f'MI300x {key} Achievable Peak',
-            line=dict(color=color_map[1], dash='solid')
-        )
-        for key in caches['MI300x'].keys()
-    ]
-
-    # Truncate long kernel names (looking at you, rocblas)
-    df['short_name'] = np.where(
-        df.index.str.len() > 50,
-        df.index.str.slice(0, 47) + '…',  # 47 + 1 char ellipsis = 48 visible chars
-        df.index
-    )
-    # Truncate long kernel names (looking at you, rocblas)
-    df_plot['short_name'] = np.where(
-        df_plot['KernelName'].str.len() > 50,
-        df_plot['KernelName'].str.slice(0, 47) + '…',  # 47 + 1 char ellipsis = 48 visible chars
-        df_plot['KernelName']
-    )
-
-    # Layout with log-log axes and slider
-    layout = go.Layout(
-        title=f'Roofline Plot for kernels in {roofCountFilename}',
-        xaxis=dict(
-            type='log',
-            title=f'Arithmetic Intensity (Flops per Byte Accessed)',
-            range=[np.log10(x_min), np.log10(x_max)],
-            autorange=False
-        ),
-        yaxis=dict(
-            type='log',
-            title='Throughput (GFLOPs/s)',
-            range=[np.log10(y_min), np.log10(y_max)],
-            autorange=False
-        )
-    )
-
-    def interactive_plot(cache):
-
-        # Add scatter plot
-        scatter_items = []
-        for name in df_plot['KernelName'].unique():
-            kernels = df_plot[df_plot['KernelName'] == name]
-            short_name = kernels.iloc[0]['short_name']
-            short_name += f'\t{round(kernels.iloc[0]["PercentageAggregate"], 3)}% runtime'
-            # Pass name, percent for tooltip
-            customdata=np.stack([kernels['short_name'], kernels['Percentage'], kernels['Index'], kernels['TotalKernels'], kernels['PercentageAggregate'], kernels['PEAK'], kernels['LIMITER']], axis=-1)
-            scatter_items.append(go.Scatter(
-                x=kernels[f'AI_{cache}_TOT'],
-                y=kernels['Throughput'],
-                mode='markers',
-                name=short_name,
-                marker=dict(color=kernels['color']),
-                visible=False,
-                customdata = customdata,
-                hovertemplate=
-                    'Name: %{customdata[0]}<br>' +
-                    'Index: %{customdata[2]} / %{customdata[3]}<br>' +
-                    'AI: %{x}<br>' +
-                    'Achieved throughput: %{y:.3f} GFLOPs/s<br>' +
-                    'Peak throughput: %{customdata[5]:.3f} GFLOPs/s<br>' +
-                    'Performance limiter: %{customdata[6]}<br>' +
-                    'Aggregate percent runtime: %{customdata[4]:.5f} %<br>' +
-                    'Individual percent runtime: %{customdata[1]:.5f} %<extra></extra>'
-            ))
-
-        return scatter_items
-
-    def interactive_plot_agg(cache):
-
-        # Add scatter plot
-        scatter_items = []
-        for index, kernel in df.iterrows():
-            short_name = kernel['short_name']
-            short_name += f'\t{round(kernel["Percentage"], 3)}% runtime'
-            # Pass name, percent for tooltip
-            customdata=np.stack([[kernel['short_name']], [kernel['Percentage']], [kernel['PEAK']], [kernel['LIMITER']], [kernel['Count']]], axis=-1)
-            scatter_items.append(go.Scatter(
-                x=[kernel[f'AI_{cache}_TOT']],
-                y=[kernel['Throughput']],
-                mode='markers',
-                name=short_name,
-                marker=dict(color=kernel['color']),
-                visible=False,
-                customdata = customdata,
-                hovertemplate=
-                    'Name: %{customdata[0]}<br>' +
-                    'AI: %{x}<br>' +
-                    'Achieved throughput: %{y:.3f} GFLOPs/s<br>' +
-                    'Peak throughput: %{customdata[2]:.3f} GFLOPs/s<br>' +
-                    'Performance limiter: %{customdata[3]}<br>' +
-                    'Total dispatches: %{customdata[4]}<br>' +
-                    'Aggregate percent runtime: %{customdata[1]:.5f} %<br>' +
-                    '<extra></extra>'
-            ))
-
-        return scatter_items
-
-    scatter_hbm = interactive_plot('HBM')
-    scatter_l2 = interactive_plot('L2')
-    scatter_l1 = interactive_plot('vL1d')
-    scatter_lds = interactive_plot('LDS')
-    scatter_hbm_agg = interactive_plot_agg('HBM')
-    scatter_l2_agg = interactive_plot_agg('L2')
-    scatter_l1_agg = interactive_plot_agg('vL1d')
-    scatter_lds_agg = interactive_plot_agg('LDS')
-
-
-    # Check for MI200/300
-    if df_plot.keys().str.contains('TCC_BUBBLE').sum() > 0:
-        rooflines = mi300a_lines + mi300x_lines
+    # Get runtime stats
+    if isinstance(results, str):
+        df_runtime = pd.read_csv(results)
+    elif isinstance(results, pd.DataFrame):
+        df_runtime = results
     else:
-        rooflines = mi250x_lines
+        raise TypeError("results must be a file path (str) or pandas DataFrame")
 
-    # Set HBM aggregate as default visibility
-    for scatter in scatter_hbm_agg:
-        scatter.visible = True
-    for roofline in rooflines:
-        roofline.line.width = 1
-    for roofline in rooflines[::4]:
-        roofline.line.width = 3
+    # Confirm these columns match between df_roof and df_runtime
+    indexes = [
+        "Index",
+        "Agent_Id",
+        "Grid_Size",
+        "KernelName",
+        "Queue_Id",
+        "Workgroup_Size",
+    ]
+    if "Application" in df_roof.columns and "Application" in df_runtime.columns:
+        indexes = ["Application"] + indexes
 
-    # Create slider steps based on percentage runtime thresholds
-    thresholds = df['Percentage'].tolist()
-    # Set max number of thresholds at 40, also include 0
-    thresholds.sort()
-    thresholds = [0] + thresholds[-40:]
+    # Adjust column names and calculate runtime
+    if 'Kernel_Name' in df_runtime.columns:
+        df_runtime = df_runtime.rename(columns={'Kernel_Name':'KernelName'})
+        df_runtime['Grid_Size'] = df_runtime['Grid_Size_X'] * df_runtime['Grid_Size_Y'] * df_runtime['Grid_Size_Z']
+        df_runtime['Workgroup_Size'] = df_runtime['Workgroup_Size_X'] * df_runtime['Workgroup_Size_Y'] * df_runtime['Workgroup_Size_Z']
+        df_runtime['DurationNs'] = df_runtime['End_Timestamp'] - df_runtime['Start_Timestamp']
+        df_runtime = df_runtime.rename(columns={'Dispatch_Id':'Index'})
 
-    # Create separate slider for each cache level
-    sliders = []
-    # Individual kernel dispatches
-    for c in range(4):
-        steps = []
-        for threshold in thresholds:
-            # Make the rooflines visible
-            visible = [True] * 4
-            visible = visible * int(len(rooflines)/4)
+    negative_duration = (df_runtime['DurationNs'] < 0).sum()
+    if negative_duration > 0:
+        df_runtime = df_runtime[df_runtime['DurationNs'] >= 0]
+        print(f"WARNING: {negative_duration}/{total_kernels} kernels removed for having an end timestamp before the start timestamp. Attempting to continue without them.")
 
-            # Filter the scatter plots for the correct cache
-            visible = visible + [False] * (c * len(df_plot.groupby('KernelName')))
-            visible = visible + (pd.Series(df_plot.groupby('KernelName')['PercentageAggregate'].first().tolist()).sort_values() >= threshold).tolist()[::-1]
-            visible = visible + [False] * ((3 - c) * len(df_plot.groupby('KernelName')))
-            # Aggregates
-            visible = visible + [False] * (4 * len(df))
-            steps.append(dict(
-                method="update",
-                args=[{"visible": visible}],
-                label=f"{threshold:.3f}%"
-            ))
-        sliders.append(dict(
-            active=0,
-            currentvalue={"prefix": "Minimum Percent Runtime: "},
-            pad={"t": 50},
-            steps=steps
-        ))
-    # Aggregate kernel dispatches
-    for c in range(4):
-        steps = []
-        for threshold in thresholds:
-            # Make the rooflines visible
-            visible = [True] * 4
-            visible = visible * int(len(rooflines)/4)
+    total_counter_kernels = df_roof.shape[0]
 
-            # Filter the scatter plots for the correct cache
-            visible = visible + [False] * (4 * len(df_plot.groupby('KernelName')))
-            # Aggregates
-            visible = visible + [False] * (c * len(df))
-            visible = visible + (pd.Series(df['Percentage'].tolist()).sort_values() >= threshold).tolist()[::-1]
-            visible = visible + [False] * ((3 - c) * len(df))
-            steps.append(dict(
-                method="update",
-                args=[{"visible": visible}],
-                label=f"{threshold:.3f}%"
-            ))
-        sliders.append(dict(
-            active=0,
-            currentvalue={"prefix": "Minimum Percent Runtime: "},
-            pad={"t": 50},
-            steps=steps
-        ))
+    # Merge runtimes into df_roof to get per-dispatch weight (Percentage of total runtime)
+    df_roof = df_roof.merge(df_runtime[indexes + ['DurationNs']], on=indexes)
 
-    # Add disclaimer if kernel dispatches need to be filtered
-    disclaimer = None
-    if df_plot.iloc[0]['TotalKernels'] > n_samples:
-        disclaimer = dict(
-            text=f"Depicting {n_samples} kernel dispatches out of {df_plot.iloc[0]['TotalKernels']}",
-            xref="paper", yref="paper",
-            x=1, y=0.05,
-            showarrow=False,
-            font=dict(size=12),
-            xanchor='left',
-            yanchor='top'
+    total_omitted_kernels_round_2 = total_counter_kernels - df_roof.shape[0]
+
+    if total_omitted_kernels_round_2 > 0:
+        print(f"WARNING: {total_omitted_kernels_round_2}/{total_kernels} kernels can't be analyzed due to non-deterministic runs between counter collection and timing. Attempting to continue without them.")
+
+    df_roof['Percentage'] = df_roof['DurationNs'] / df_roof['DurationNs'].sum() * 100
+
+    # Aggregate kernels with weighted average by percentage of total runtime
+    exclude = {'Percentage', 'DurationNs', 'TOTAL_OPS', 'BW_HBM', 'BW_L2', 'BW_vL1d', 'BW_LDS'}
+    num_cols = [c for c in df_roof.select_dtypes(include=[np.number]).columns if c not in exclude]
+    weight_sum = df_roof.groupby('KernelName', sort=False)['Percentage'].sum()
+    df = (df_roof[num_cols].mul(df_roof['Percentage'], axis=0)
+          .groupby(df_roof['KernelName'], sort=False).sum()
+          .div(weight_sum, axis=0)).reset_index()
+
+    # Calculate total, average, and percentage runtimes for aggregated kernels
+    totalRuntimes = df_roof.groupby('KernelName')['DurationNs'].sum()
+    averageRuntimes = df_roof.groupby('KernelName')['DurationNs'].mean()
+    percentRuntimes = df_roof.groupby('KernelName').sum()['DurationNs']/df_roof['DurationNs'].sum()*100
+
+    # Merge runtimes into df
+    df = pd.merge(df, totalRuntimes, on='KernelName').rename(columns={"DurationNs":"RuntimeNs"})
+    df = pd.merge(df, averageRuntimes, on='KernelName').rename(columns={"DurationNs":"AverageNs"})
+    df = pd.merge(df, percentRuntimes, on='KernelName').rename(columns={"DurationNs":"Percentage"})
+
+    # Add column for number of dispatches
+    df = df.merge(df_roof.groupby('KernelName', sort=False).size().reset_index(name='Count'), on='KernelName')
+    # Add total operations for aggregated kernels
+    totalOps = df_roof.groupby('KernelName')['TOTAL_OPS'].mean()
+    totalBwHbm = df_roof.groupby('KernelName')['BW_HBM'].mean()
+    totalBwL2 = df_roof.groupby('KernelName')['BW_L2'].mean()
+    totalBwVl1d = df_roof.groupby('KernelName')['BW_vL1d'].mean()
+    totalBwLds = df_roof.groupby('KernelName')['BW_LDS'].mean()
+    df = pd.merge(df, totalOps, on='KernelName')
+    df = pd.merge(df, totalBwHbm, on='KernelName')
+    df = pd.merge(df, totalBwL2, on='KernelName')
+    df = pd.merge(df, totalBwVl1d, on='KernelName')
+    df = pd.merge(df, totalBwLds, on='KernelName')
+    # Recalculate arithmetic intensity for aggregated kernels
+    df['AI_HBM_TOT'] = df['TOTAL_OPS'] / df['BW_HBM']
+    df['AI_L2_TOT'] = df['TOTAL_OPS'] / df['BW_L2']
+    df['AI_vL1d_TOT'] = df['TOTAL_OPS'] / df['BW_vL1d']
+    df['AI_LDS_TOT'] = df['TOTAL_OPS'] / df['BW_LDS']
+    # Recalculate peaks for aggregated kernels
+    df['HBM_BW_PEAK'] = df['AI_HBM_TOT'] * caches[arch]['HBM']
+    df['HBM_BW_PEAK_LINEAR'] = df['HBM_BW_PEAK']
+    df['L2_BW_PEAK'] = df['AI_L2_TOT'] * caches[arch]['L2']
+    df['vL1d_BW_PEAK'] = df['AI_vL1d_TOT'] * caches[arch]['vL1d']
+    df['LDS_BW_PEAK'] = df['AI_LDS_TOT'] * caches[arch]['LDS']
+    df['LDS_BW_PEAK_LINEAR'] = df['LDS_BW_PEAK']
+
+    _bw_agg_path = _config_dir / "benchWarmer.csv"
+    _df_bw_agg = pd.read_csv(_bw_agg_path)
+    _peaks_agg = _load_peaks(_df_bw_agg, arch, df)
+    if _use_hbm_alpha_model(arch):
+        _alpha_agg = _compute_weighted_hbm_alpha(df, _peaks_agg, arch)
+        df["HBM_BW_PEAK"] = _exclude_bw_roof_when_no_traffic(
+            _hbm_roof_throughput(
+                df["AI_HBM_TOT"],
+                caches[arch]["HBM"],
+                df["KERNEL_COMPUTE_PEAK"],
+                _alpha_agg,
+            ),
+            df["BW_HBM"],
+        )
+        df["HBM_ALPHA"] = _alpha_agg
+
+    if _use_lds_alpha_model(arch):
+        _alpha_lds_agg = _compute_weighted_lds_alpha(df, _peaks_agg, arch)
+        df["LDS_BW_PEAK"] = _exclude_bw_roof_when_no_traffic(
+            _hbm_roof_throughput(
+                df["AI_LDS_TOT"],
+                caches[arch]["LDS"],
+                df["KERNEL_COMPUTE_PEAK"],
+                _alpha_lds_agg,
+            ),
+            df["BW_LDS"],
+        )
+        df["LDS_ALPHA"] = _alpha_lds_agg
+
+    insigKernels = len(df[df['Percentage'] < sigRuntime])  # save this value for guided analysis
+
+    # Drop temporary weight columns so full merge with df_runtime does not create _x/_y duplicates
+    df_roof = df_roof.drop(columns=['DurationNs', 'Percentage'])
+    df_roof = df_roof.merge(df_runtime, on=indexes)
+
+    df.set_index('KernelName', inplace=True)
+
+    # Prepare for analysis
+    df = df.sort_values(by='Percentage', ascending=False)
+    df_peaks = df[['HBM_BW_PEAK','L2_BW_PEAK','vL1d_BW_PEAK','LDS_BW_PEAK','KERNEL_COMPUTE_PEAK']]
+    df['PEAK'] = df_peaks.where(df_peaks > 0).min(axis=1)
+
+    df['LIMITER'] = _safe_limiters(df_peaks.where(df_peaks > 0), 5, " (" + arch + ")")
+    df_peaks_linear = df[
+        ['HBM_BW_PEAK_LINEAR', 'L2_BW_PEAK', 'vL1d_BW_PEAK', 'LDS_BW_PEAK_LINEAR', 'KERNEL_COMPUTE_PEAK']
+    ]
+    df['PEAK_LINEAR'] = df_peaks_linear.where(df_peaks_linear > 0).min(axis=1)
+    df['LIMITER_LINEAR'] = _safe_limiters(df_peaks_linear.where(df_peaks_linear > 0), 5, " (" + arch + ")")
+    df["LIMITER"] = _align_curved_limiter_with_linear_compute(
+        df["LIMITER"], df["LIMITER_LINEAR"]
+    )
+    df['Throughput'] = df['TOTAL_OPS'] / df['AverageNs']
+    df['PercentAchieved'] = _percent_roof_achieved(df['Throughput'], df['PEAK'])
+    df['PercentAchieved_LINEAR'] = _percent_roof_achieved(df['Throughput'], df['PEAK_LINEAR'])
+
+    # When neither the HBM nor LDS α-blended (curved) model is available for
+    # this arch, PEAK / LIMITER / PercentAchieved all collapse to the linear
+    # piecewise-linear values. Track this so the CLI output avoids labeling
+    # those numbers as "curved".
+    curved_avail = _use_hbm_alpha_model(arch) or _use_lds_alpha_model(arch)
+
+    # Guided analysis
+    print(f"Total unique kernels: {len(df)}")
+    print(f"Total kernel dispatches: {len(df_roof)}")
+    for index, row in df.iterrows():  # loop through each kernel
+        if row['Percentage'] < sigRuntime:
+            continue
+        print("\n" + index)
+        print(f"  Total contribution to GPU time: {round(row['Percentage'], 3)} %")
+        print(f"  Total runtime (all dispatches):", "{:.3e}".format(row['RuntimeNs']), "ns ({:.3f} s)".format(row['RuntimeNs'] / 1e9))
+        print(f"  Average runtime per dispatch:  ", "{:.3e}".format(row['AverageNs']), "ns ({:.3f} ms)".format(row['AverageNs'] / 1e6))
+        print(f"  Total dispatches:               {int(row['Count'])}")
+
+        print()
+
+        print(f"  Total operations per dispatch: ", "{:.3e}".format(row['TOTAL_OPS']), "ops")
+
+        print()
+
+        print(f"  Total bytes moved (HBM):        {_format_byte_size(row['BW_HBM'])}")
+        print(f"  Total bytes moved (L2):         {_format_byte_size(row['BW_L2'])}")
+        print(f"  Total bytes moved (L1):         {_format_byte_size(row['BW_vL1d'])}")
+        print(f"  Total bytes moved (LDS):        {_format_byte_size(row['BW_LDS'])}")
+
+        print()
+
+        print(f"  Arithmetic intensity (HBM):    ", round(row['AI_HBM_TOT'], 4))
+        print(f"  Arithmetic intensity (L2):     ", round(row['AI_L2_TOT'], 4))
+        print(f"  Arithmetic intensity (L1):     ", round(row['AI_vL1d_TOT'], 4))
+        print(f"  Arithmetic intensity (LDS):    ", round(row['AI_LDS_TOT'], 4))
+
+        if curved_avail:
+            print()
+            print(
+                f"  Linear roofline performance limiter:  ",
+                row["LIMITER_LINEAR"],
+            )
+            print(
+                f"  Linear roofline peak throughput:      ",
+                round(row["PEAK_LINEAR"], 2),
+                "GFLOPS/s",
+            )
+            print(
+                f"  Percent of linear roofline achieved:  ",
+                round(row["PercentAchieved_LINEAR"], 4),
+                "%",
+            )
+
+        _roof_label = "Curved" if curved_avail else "Linear"
+        print(f"\n  {_roof_label} performance limiter:           ", row['LIMITER'])
+        print(f"  {_roof_label} roofline peak throughput:      ", round(row['PEAK'], 2), "GFLOPS/s")
+        print(f"  Percent of {_roof_label.lower()} roofline achieved:  ", round(row['PercentAchieved'], 4), "%")
+        if 'KERNEL_COMPUTE' in row['LIMITER']:
+            inst_mix = [
+                ("FP16 Add",    64 * row['SQ_INSTS_VALU_ADD_F16']),
+                ("FP16 Mul",    64 * row['SQ_INSTS_VALU_MUL_F16']),
+                ("FP16 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F16']),
+                ("FP16 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F16']),
+                ("FP32 Add",    64 * row['SQ_INSTS_VALU_ADD_F32']),
+                ("FP32 Mul",    64 * row['SQ_INSTS_VALU_MUL_F32']),
+                ("FP32 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F32']),
+                ("FP32 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F32']),
+                ("FP64 Add",    64 * row['SQ_INSTS_VALU_ADD_F64']),
+                ("FP64 Mul",    64 * row['SQ_INSTS_VALU_MUL_F64']),
+                ("FP64 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F64']),
+                ("FP64 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F64']),
+                ("INT32",       row['TOTAL_VALU_I32']),
+                ("INT64",       row['TOTAL_VALU_I64']),
+                ("FP16 MFMA",   row['TOTAL_MOPS_F16']),
+                ("BF16 MFMA",   row['TOTAL_MOPS_BF16']),
+                ("FP32 MFMA",   row['TOTAL_MOPS_F32']),
+                ("FP64 MFMA",   row['TOTAL_MOPS_F64']),
+                ("SALU",        row['TOTAL_SALU']),
+            ]
+            if 'TOTAL_MOPS_F8' in row.index:
+                inst_mix.append(("FP8 MFMA", row['TOTAL_MOPS_F8']))
+            if 'TOTAL_MOPS_I8' in row.index:
+                inst_mix.append(("I8 MFMA", row['TOTAL_MOPS_I8']))
+            if 'TOTAL_VALU_OTHER' in row.index:
+                inst_mix.append(("Other VALU", row['TOTAL_VALU_OTHER']))
+            total_ops = sum(ops for _, ops in inst_mix)
+            if total_ops > 0:
+                inst_mix = [(label, ops / total_ops * 100) for label, ops in inst_mix if ops > 0]
+                inst_mix.sort(key=lambda x: x[1], reverse=True)
+                print()
+                print(f"  Instruction mix:")
+                for label, pct in inst_mix:
+                    print(f"    {label + ':':20s} {pct:5.1f}%")
+
+        # Calculate achieved
+        achieved = row['Throughput']
+        print(f"\n  Achieved throughput:           ", round(achieved, 2), "GFLOPS/s (weighted average)")
+
+    print(f"\n{insigKernels} kernels omitted from CLI output for having less than {sigRuntime} percent GPU time (use --sig-runtime to change threshold)")
+    print(f"\nTotal application GPU time on {arch}: {df_runtime['DurationNs'].sum():.2e} ns ({df_runtime['DurationNs'].sum()/1e9:.6f} s)")
+    print()
+
+    df_roof['Percentage'] = df_roof['DurationNs']/sum(totalRuntimes) * 100
+    df_roof['Throughput'] = df_roof['TOTAL_OPS'] / df_roof['DurationNs']
+    df_roof['PercentAchieved'] = _percent_roof_achieved(df_roof['Throughput'], df_roof['PEAK'])
+    df_roof['PercentAchieved_LINEAR'] = _percent_roof_achieved(df_roof['Throughput'], df_roof['PEAK_LINEAR'])
+    df_roof = df_roof.rename(columns={'KernelName_x':'KernelName'}).merge(df['Percentage'],on='KernelName')
+    df_roof = df_roof.rename(columns={'Percentage_x':'Percentage'})
+    df_roof = df_roof.rename(columns={'Percentage_y':'PercentageAggregate'})
+    _pct = df_roof['Percentage'].astype(float)
+    _pa = df_roof['PercentAchieved']
+    _pa_linear = df_roof['PercentAchieved_LINEAR']
+    _w = _pct.notna() & _pa.notna() & (_pct > 0)
+    _w_linear = _pct.notna() & _pa_linear.notna() & (_pct > 0)
+    if _w.any():
+        roofline_percentage = (_pct[_w] * _pa[_w]).sum() / _pct[_w].sum()
+    else:
+        roofline_percentage = float("nan")
+    if _w_linear.any():
+        roofline_percentage_linear = (_pct[_w_linear] * _pa_linear[_w_linear]).sum() / _pct[_w_linear].sum()
+    else:
+        roofline_percentage_linear = float("nan")
+    if curved_avail:
+        print(f"Average percent of linear roofline achieved: {roofline_percentage_linear:.3f} %")
+        print(f"Average percent of curved roofline achieved: {roofline_percentage:.3f} %")
+    else:
+        # PEAK == PEAK_LINEAR in this case, so there's only one meaningful number to report.
+        print(f"Average percent of linear roofline achieved: {roofline_percentage_linear:.3f} %")
+    print()
+
+    # Interactive roofline plot (D3)
+    if plot:
+        df_plot = df_roof.copy()
+        total_dispatches_orig = len(df_plot)
+        df_plot["TotalKernels"] = total_dispatches_orig
+
+        n_samples_cap = 50000
+        if len(df_plot) > n_samples_cap:
+            df_plot = df_plot.sort_values("Index")
+            df_plot = df_plot.iloc[:: len(df_plot) // n_samples_cap]
+
+        df_plot = df_plot.sort_values(by="PercentageAggregate", ascending=False)
+
+        name_to_color = {name: _QUAL_COLORS[i % len(_QUAL_COLORS)] for i, name in enumerate(df.index)}
+        df_plot["color"] = [name_to_color[name] for name in df_plot["KernelName"]]
+        df = df.copy()
+        df["color"] = [name_to_color[name] for name in df.index]
+
+        percentage_desc = df["Percentage"].sort_values(ascending=False)
+        cumulative_percentage_by_value = (
+            percentage_desc.groupby(percentage_desc, sort=False).sum().cumsum()
+        )
+        df["CumulativePercentageAbove"] = df["Percentage"].map(cumulative_percentage_by_value)
+        df_plot = df_plot.merge(df["CumulativePercentageAbove"], on="KernelName")
+
+        x_min = 0.001
+        x_max = 100000
+        y_min = 0.5
+        y_max = 200000
+
+        x_vals = np.logspace(np.log10(x_min), np.log10(x_max), 200)
+        compute_peak = float(df["COMPUTE_PEAK"].iloc[0])
+        x_vals = np.sort(
+            np.append(x_vals, [compute_peak / caches[arch][cache] for cache in caches[arch]])
         )
 
-    # Combine scatters and rooflines
-    fig = go.Figure(data=rooflines + scatter_hbm + scatter_l2 + scatter_l1 + scatter_lds + scatter_hbm_agg + scatter_l2_agg + scatter_l1_agg + scatter_lds_agg, layout=layout)
-    fig.update_layout(
-        sliders=[sliders[4]],
-        plot_bgcolor="white",
-        xaxis=dict(
-            gridcolor="lightgray",
-            zerolinecolor="lightgray",
-            linecolor="black",
-        ),
-        yaxis=dict(
-            gridcolor="lightgray",
-            zerolinecolor="lightgray",
-            linecolor="black",
-        ),
-        updatemenus=[
-            # Add dark mode toggle
-            dict(
-                type="buttons",
-                direction="right",
-                buttons=list([
-                    dict(label="Light Mode",
-                        method="relayout",
-                        args=[{
-                            "plot_bgcolor": "white",
-                            "paper_bgcolor": "white",
-                            "font.color": "black",
-                            "xaxis.gridcolor": "lightgray",
-                            "xaxis.zerolinecolor": "lightgray",
-                            "xaxis.linecolor": "black",
-                            "yaxis.gridcolor": "lightgray",
-                            "yaxis.zerolinecolor": "lightgray",
-                            "yaxis.linecolor": "black"
-                        }]),
-                    dict(label="Dark Mode",
-                        method="relayout",
-                        args=[{
-                            "plot_bgcolor": "black",
-                            "paper_bgcolor": "black",
-                            "font.color": "white",
-                            "xaxis.gridcolor": "gray",
-                            "xaxis.zerolinecolor": "gray",
-                            "xaxis.linecolor": "white",
-                            "yaxis.gridcolor": "gray",
-                            "yaxis.zerolinecolor": "gray",
-                            "yaxis.linecolor": "white"
-                        }])
-                ]),
-                pad={"r": 10, "t": 10},
-                showactive=True,
-                x=1,
-                xanchor="right",
-                y=1.1,
-                yanchor="top"
-            ),
-            # Add memory hierarchy toggle
-            dict(
-                type="buttons",
-                direction="down",
-                buttons=list([
-                    dict(label="HBM Agg",
-                        method="update",
-                        args=[
-                            {
-                                "line": [
-                                    {"width": 3 if j == 0 else 1, "color": color_map[i]}
-                                    for i in range(int(len(rooflines) / 4))
-                                    for j in range(4)
-                                ],
-                                "visible": (
-                                    [True] * len(rooflines) +
-                                    [False] * len(scatter_hbm) * 4 +
-                                    [True] * len(scatter_hbm_agg) +
-                                    [False] * len(scatter_hbm_agg) * 3
-                                ),
-                            }, {
-                                "sliders": [sliders[4]],
-                                "annotations": [None]
-                            }
-                        ]),
-                    dict(label="HBM",
-                        method="update",
-                        args=[
-                            {
-                                "line": [
-                                    {"width": 3 if j == 0 else 1, "color": color_map[i]}
-                                    for i in range(int(len(rooflines) / 4))
-                                    for j in range(4)
-                                ],
-                                "visible": (
-                                    [True] * len(rooflines) +
-                                    [True] * len(scatter_hbm) +
-                                    [False] * len(scatter_hbm) * 3 +
-                                    [False] * len(scatter_hbm_agg) * 4
-                                ),
-                            }, {
-                                "sliders": [sliders[0]],
-                                "annotations": [disclaimer]
-                            }
-                        ]),
-                    dict(label="L2 Agg",
-                        method="update",
-                        args=[{
-                                "line": [
-                                    {"width": 3 if j == 1 else 1, "color": color_map[i]}
-                                    for i in range(int(len(rooflines) / 4))
-                                    for j in range(4)
-                                ],
-                                "visible": (
-                                    [True] * len(rooflines) +
-                                    [False] * len(scatter_l2) * 4 +
-                                    [False] * len(scatter_l2_agg) +
-                                    [True] * len(scatter_l2_agg) +
-                                    [False] * len(scatter_l2_agg) * 2
-                                ),
-                            }, {
-                                "sliders": [sliders[5]],
-                                "annotations": [None]
-                            }
-                        ]),
-                    dict(label="L2",
-                        method="update",
-                        args=[{
-                                "line": [
-                                    {"width": 3 if j == 1 else 1, "color": color_map[i]}
-                                    for i in range(int(len(rooflines) / 4))
-                                    for j in range(4)
-                                ],
-                                "visible": (
-                                    [True] * len(rooflines) +
-                                    [False] * len(scatter_l2) +
-                                    [True] * len(scatter_l2) +
-                                    [False] * len(scatter_l2) * 2 +
-                                    [False] * len(scatter_l2_agg) * 4
-                                ),
-                            }, {
-                                "sliders": [sliders[1]],
-                                "annotations": [disclaimer]
-                            }
-                        ]),
-                    dict(label="vL1d Agg",
-                        method="update",
-                        args=[{
-                                "line": [
-                                    {"width": 3 if j == 2 else 1, "color": color_map[i]}
-                                    for i in range(int(len(rooflines) / 4))
-                                    for j in range(4)
-                                ],
-                                "visible": (
-                                    [True] * len(rooflines) +
-                                    [False] * len(scatter_l1) * 4 +
-                                    [False] * len(scatter_l1_agg) * 2 +
-                                    [True] * len(scatter_l1_agg) +
-                                    [False] * len(scatter_l1_agg)
-                                ),
-                            }, {
-                                "sliders": [sliders[6]],
-                                "annotations": [None]
-                            }
-                        ]),
-                    dict(label="vL1d",
-                        method="update",
-                        args=[{
-                                "line": [
-                                    {"width": 3 if j == 2 else 1, "color": color_map[i]}
-                                    for i in range(int(len(rooflines) / 4))
-                                    for j in range(4)
-                                ],
-                                "visible": (
-                                    [True] * len(rooflines) +
-                                    [False] * len(scatter_l1) * 2 +
-                                    [True] * len(scatter_l1) +
-                                    [False] * len(scatter_l1) +
-                                    [False] * len(scatter_l1_agg) * 4
-                                ),
-                            }, {
-                                "sliders": [sliders[2]],
-                                "annotations": [disclaimer]
-                            }
-                        ]),
-                    dict(label="LDS Agg",
-                        method="update",
-                        args=[{
-                                "line": [
-                                    {"width": 3 if j == 3 else 1, "color": color_map[i]}
-                                    for i in range(int(len(rooflines) / 4))
-                                    for j in range(4)
-                                ],
-                                "visible": (
-                                    [True] * len(rooflines) +
-                                    [False] * len(scatter_lds) * 4 +
-                                    [False] * len(scatter_lds_agg) * 3 +
-                                    [True] * len(scatter_lds_agg)
-                                ),
-                            }, {
-                                "sliders": [sliders[7]],
-                                "annotations": [None]
-                            }
-                        ]),
-                    dict(label="LDS",
-                        method="update",
-                        args=[{
-                                "line": [
-                                    {"width": 3 if j == 3 else 1, "color": color_map[i]}
-                                    for i in range(int(len(rooflines) / 4))
-                                    for j in range(4)
-                                ],
-                                "visible": (
-                                    [True] * len(rooflines) +
-                                    [False] * len(scatter_lds) * 3 +
-                                    [True] * len(scatter_lds) +
-                                    [False] * len(scatter_lds_agg) * 4
-                                ),
-                            }, {
-                                "sliders": [sliders[3]],
-                                "annotations": [disclaimer]
-                            }
-                        ]),
-                ]),
-                showactive=True,
-            ),
+        cache_key_list = list(caches[arch].keys())
+        rooflines_payload = []
+        for key in cache_key_list:
+            y_line = np.minimum(caches[arch][key] * x_vals, compute_peak)
+            rooflines_payload.append(
+                {"key": key, "x": x_vals.tolist(), "y": y_line.tolist()}
+            )
 
+        dispatch = []
+        for _, row in df_plot.iterrows():
+            kid = row["KernelName"]
+            idx = row["Index"]
+            dispatch.append(
+                {
+                    "id": f"{kid}\x00{idx}",
+                    "kernelName": str(kid),
+                    "nameDisplay": _wrap_kernel_name_tooltip(str(kid)),
+                    "ai": {
+                        "HBM": _json_safe_float(row["AI_HBM_TOT"]),
+                        "L2": _json_safe_float(row["AI_L2_TOT"]),
+                        "vL1d": _json_safe_float(row["AI_vL1d_TOT"]),
+                        "LDS": _json_safe_float(row["AI_LDS_TOT"]),
+                    },
+                    "throughput": _json_safe_float(row["Throughput"]),
+                    "percentAchieved": _json_safe_float(row["PercentAchieved"]),
+                    "percentage": _json_safe_float(row["Percentage"]),
+                    "percentageAggregate": _json_safe_float(row["PercentageAggregate"]),
+                    "cumulativePct": _json_safe_float(row["CumulativePercentageAbove"]),
+                    "index": int(row["Index"]) if pd.notna(row["Index"]) else 0,
+                    "totalKernels": int(row["TotalKernels"]),
+                    "peak": _json_safe_float(row["PEAK"]),
+                    "peakLinear": _json_safe_float(row.get("PEAK_LINEAR")),
+                    "kernelComputePeak": _json_safe_float(row["KERNEL_COMPUTE_PEAK"]),
+                    "limiter": str(row["LIMITER"]),
+                    "limiterLinear": str(row["LIMITER_LINEAR"]) if "LIMITER_LINEAR" in row.index else None,
+                    "color": str(row["color"]),
+                }
+            )
+
+        aggregate = []
+        for index, kernel in df.iterrows():
+            aggregate.append(
+                {
+                    "id": str(index),
+                    "kernelName": str(index),
+                    "nameDisplay": _wrap_kernel_name_tooltip(str(index)),
+                    "ai": {
+                        "HBM": _json_safe_float(kernel["AI_HBM_TOT"]),
+                        "L2": _json_safe_float(kernel["AI_L2_TOT"]),
+                        "vL1d": _json_safe_float(kernel["AI_vL1d_TOT"]),
+                        "LDS": _json_safe_float(kernel["AI_LDS_TOT"]),
+                    },
+                    "throughput": _json_safe_float(kernel["Throughput"]),
+                    "percentAchieved": _json_safe_float(kernel["PercentAchieved"]),
+                    "percentage": _json_safe_float(kernel["Percentage"]),
+                    "cumulativePct": _json_safe_float(kernel["CumulativePercentageAbove"]),
+                    "peak": _json_safe_float(kernel["PEAK"]),
+                    "peakLinear": _json_safe_float(kernel.get("PEAK_LINEAR")),
+                    "limiter": str(kernel["LIMITER"]),
+                    "limiterLinear": str(kernel["LIMITER_LINEAR"]) if "LIMITER_LINEAR" in kernel.index else "",
+                    "count": int(kernel["Count"]),
+                    "color": str(kernel["color"]),
+                }
+            )
+
+        thresholds = df["CumulativePercentageAbove"].tolist()
+        thresholds.sort(reverse=True)
+        thresholds = [100] + thresholds[-40:]
+
+        disclaimer_text = ""
+        if total_dispatches_orig > len(df_plot):
+            disclaimer_text = (
+                f"Depicting {len(df_plot)} kernel dispatches out of {total_dispatches_orig}"
+            )
+
+        df_kleg = df.sort_values("Percentage", ascending=False)
+        kernel_legend = [
+            {
+                "name": str(kn),
+                "color": str(row["color"]),
+                "pct": _json_safe_float(row["Percentage"]),
+            }
+            for kn, row in df_kleg.iterrows()
         ]
-    )
 
-    fig.write_html(f'{roofCountFilename}.html')
-    print(f"Roofline plot saved to                  {roofCountFilename}.html")
+        kernel_compute_peak_by_name = {
+            str(kn): _json_safe_float(val)
+            for kn, val in df["KERNEL_COMPUTE_PEAK"].items()
+            if pd.notna(val) and np.isfinite(val) and float(val) > 0
+        }
 
-    print(f"Arithmetic intensity bar plot saved to  {roofCountFilename}_plot.png")
-    if args.hw_metrics != None:
-        print(f"Clocks and telemetry data plot saved to {hwFilename}_plot.png")
+        use_hbm_alpha = _use_hbm_alpha_model(arch)
+        kernel_hbm_alpha_by_name = {}
+        if use_hbm_alpha and "HBM_ALPHA" in df.columns:
+            for kn, r in df.iterrows():
+                a = r.get("HBM_ALPHA")
+                if pd.notna(a) and np.isfinite(a):
+                    kernel_hbm_alpha_by_name[str(kn)] = {"alpha": float(a)}
 
-# Output Results to CSV
-if args.dump:
-    df.to_csv(roofCountFilename + '_EXTRACTED_AGG.csv')
-    df_roof.to_csv(roofCountFilename + '_EXTRACTED.csv')
-    print(f"Full dataframe dumped to                {roofCountFilename}_EXTRACTED.csv")
-    print(f"Aggregate kernels dataframe dumped to   {roofCountFilename}_EXTRACTED_AGG.csv")
+        _def_alpha = _default_hbm_alpha_fp32_fma(arch) if use_hbm_alpha else None
+
+        use_lds_alpha = _use_lds_alpha_model(arch)
+        kernel_lds_alpha_by_name = {}
+        if use_lds_alpha and "LDS_ALPHA" in df.columns:
+            for kn, r in df.iterrows():
+                a = r.get("LDS_ALPHA")
+                if pd.notna(a) and np.isfinite(a):
+                    kernel_lds_alpha_by_name[str(kn)] = {"alpha": float(a)}
+
+        _def_lds_alpha = _default_lds_alpha_fp32_fma(arch) if use_lds_alpha else None
+
+        payload = {
+            "meta": {
+                "title": f"Roofline Plot for kernels in {roofCountFilename}",
+                "xMin": x_min,
+                "xMax": x_max,
+                "yMin": y_min,
+                "yMax": y_max,
+                "xAxisTitle": "Arithmetic Intensity (Flops per Byte Accessed)",
+                "yAxisTitle": "Throughput (GFLOPs/s)",
+                "disclaimer": disclaimer_text,
+                "computePeak": _json_safe_float(compute_peak),
+                "useHbmAlphaModel": use_hbm_alpha,
+                "hbmAlphaArch": arch if use_hbm_alpha else None,
+                "defaultHbmAlphaFp32Fma": _json_safe_float(_def_alpha),
+                "useLdsAlphaModel": use_lds_alpha,
+                "ldsAlphaArch": arch if use_lds_alpha else None,
+                "defaultLdsAlphaFp32Fma": _json_safe_float(_def_lds_alpha),
+            },
+            "kernelComputePeakByName": kernel_compute_peak_by_name,
+            "kernelHbmAlphaByName": kernel_hbm_alpha_by_name,
+            "kernelLdsAlphaByName": kernel_lds_alpha_by_name,
+            "cacheKeys": cache_key_list,
+            "bandwidths": {
+                k: _json_safe_float(caches[arch][k]) for k in cache_key_list
+            },
+            "rooflines": rooflines_payload,
+            "thresholds": [float(t) for t in thresholds],
+            "dispatch": dispatch,
+            "aggregate": aggregate,
+            "kernelLegend": kernel_legend,
+        }
+
+        html_out = _build_roofline_d3_html(payload)
+        with open(f"{file_stem}.html", "w", encoding="utf-8") as _hf:
+            _hf.write(html_out)
+        print(f"Roofline plot saved to                  {file_stem}.html")
+
+    # Output Results to CSV
+    if dump:
+        df.to_csv(f'{file_stem}_EXTRACTED_AGG.csv')
+        df_roof.to_csv(f'{file_stem}_EXTRACTED.csv')
+        print(f"Full dataframe dumped to                {file_stem}_EXTRACTED.csv")
+        print(f"Aggregate kernels dataframe dumped to   {file_stem}_EXTRACTED_AGG.csv")
+
+def main():
+
+    # Get filenames from input args
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-c', '--counter', required=False, help='Provide roof_counters.csv filename from rocprof -i (required unless --directory)')
+    parser.add_argument('-r', '--results', required=False, help='Provide results.csv / trace filename from rocprof --stats (required unless --directory)')
+    parser.add_argument('-D', '--directory', required=False, metavar='DIR', help='Directory of subdirs, each with counters.csv and trace_kernel_trace.csv; plot/CSV outputs are written here')
+    parser.add_argument('--sig-runtime', required=False, default=10, type=float, help='Provide the percentage of runtime considered "significant" for analysis (kernels under that percentage will be omitted)')
+    parser.add_argument('-p', '--plot', action='store_true', required=False, help='Generate plots')
+    parser.add_argument('-d', '--dump', action='store_true', required=False, help='Dump DataFrame to csv')
+    parser.add_argument('--arch', required=False, help='Supply architecture (to aid in guided analysis). Options: MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X')
+
+    args = parser.parse_args()
+    if args.directory:
+        if args.counter is not None or args.results is not None:
+            print("Note: --directory is set; ignoring -c/--counter and -r/--results.")
+    elif not args.counter or not args.results:
+        parser.error("Provide --directory/-D, or both -c/--counter and -r/--results.")
+
+    if args.arch is not None:
+        args.arch = args.arch.replace('_', ' ').upper()
+
+    supported_arch = set(caches.keys())
+    if args.arch is not None and args.arch not in supported_arch:
+        parser.error(
+            f"Unsupported architecture '{args.arch}'. Supported: {', '.join(sorted(supported_arch))}"
+        )
+
+    if args.directory:
+        df_roof, df_runtime, base = load_from_directory(args.directory)
+        out_stem = str(Path(args.directory).resolve() / base)
+        extract(
+            df_roof,
+            df_runtime,
+            args.sig_runtime,
+            args.plot,
+            args.dump,
+            args.arch,
+            base_name=base,
+            output_stem=out_stem,
+        )
+    else:
+        extract(
+            args.counter,
+            args.results,
+            args.sig_runtime,
+            args.plot,
+            args.dump,
+            args.arch,
+            base_name=None,
+            output_stem=None,
+        )
+
+if __name__ == "__main__":
+    main()
 
