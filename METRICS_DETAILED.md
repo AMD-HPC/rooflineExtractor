@@ -32,7 +32,8 @@ This document provides equations, descriptions, and hardware counter information
 ```
 TOTAL_OPS = TOTAL_SALU + TOTAL_VALU_F16 + TOTAL_VALU_F32 + TOTAL_VALU_F64 + 
             TOTAL_VALU_I32 + TOTAL_VALU_I64 + TOTAL_MOPS_F16 + TOTAL_MOPS_BF16 + 
-            TOTAL_MOPS_F32 + TOTAL_MOPS_F64 [+ TOTAL_MOPS_F8] [+ TOTAL_MOPS_I8] [+ TOTAL_VALU_OTHER]
+            TOTAL_MOPS_F32 + TOTAL_MOPS_F64 [+ TOTAL_MOPS_F8] [+ TOTAL_MOPS_I8]
+            [+ TOTAL_MOPS_F6F4] [+ TOTAL_VALU_OTHER]
 ```
 
 Where:
@@ -48,6 +49,7 @@ Where:
 - `TOTAL_MOPS_F64 = 512 × SQ_INSTS_VALU_MFMA_MOPS_F64`
 - `TOTAL_MOPS_F8 = 512 × SQ_INSTS_VALU_MFMA_MOPS_F8` (if available)
 - `TOTAL_MOPS_I8 = 512 × SQ_INSTS_VALU_MFMA_MOPS_I8` (if available)
+- `TOTAL_MOPS_F6F4 = 512 × SQ_INSTS_VALU_MFMA_MOPS_F6F4` (if available; gfx950 only)
 
 **Notes**: 
 - The factor of 64 for VALU operations accounts for the wavefront size (64 threads per wavefront).
@@ -328,6 +330,7 @@ Matrix Fused Multiply-Add operations, each counting 512 operations per instructi
 
 - **FP8**: `SQ_INSTS_VALU_MFMA_MOPS_F8` (× 512 ops/instruction, if available)
 - **INT8**: `SQ_INSTS_VALU_MFMA_MOPS_I8` (× 512 ops/instruction, if available)
+- **F6F4** (FP4/FP6 combined, gfx950 only): `SQ_INSTS_VALU_MFMA_MOPS_F6F4` (× 512 ops/instruction, if available). Uses the FP4 MFMA peak as the achievable upper bound.
 - **FP16**: `SQ_INSTS_VALU_MFMA_MOPS_F16` (× 512 ops/instruction)
 - **BF16**: `SQ_INSTS_VALU_MFMA_MOPS_BF16` (× 512 ops/instruction)
 - **FP32**: `SQ_INSTS_VALU_MFMA_MOPS_F32` (× 512 ops/instruction)

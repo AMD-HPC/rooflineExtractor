@@ -41,6 +41,8 @@ def convert_columns_to_int(df):
         counters.append('SQ_INSTS_VALU_MFMA_MOPS_I8')
     if 'SQ_INSTS_VALU_MFMA_MOPS_F8' in df.columns:
         counters.append('SQ_INSTS_VALU_MFMA_MOPS_F8')
+    if 'SQ_INSTS_VALU_MFMA_MOPS_F6F4' in df.columns:
+        counters.append('SQ_INSTS_VALU_MFMA_MOPS_F6F4')
     # Check for CDNA2 vs. CDNA3-4 counters
     if 'TCC_BUBBLE_sum' in df.columns:
         counters.append('TCC_BUBBLE_sum')
@@ -148,6 +150,7 @@ def _compute_ai_columns(df, mem_level):
     for guard_col, suffix, total_col in [
         ('SQ_INSTS_VALU_MFMA_MOPS_F8', 'MOPS_F8', 'TOTAL_MOPS_F8'),
         ('SQ_INSTS_VALU_MFMA_MOPS_I8', 'MOPS_I8', 'TOTAL_MOPS_I8'),
+        ('SQ_INSTS_VALU_MFMA_MOPS_F6F4', 'MOPS_F6F4', 'TOTAL_MOPS_F6F4'),
     ]:
         if guard_col in df.columns:
             cols[f'AI_{mem_level}_{suffix}'] = _safe_divide(df[total_col], bw)
@@ -177,6 +180,14 @@ def _load_peaks(df_bw, arch_col, df):
         peaks['fp8_mfma'] = _lookup_peak(df_bw, 'fp8', ' mfma', arch_col)
     if 'SQ_INSTS_VALU_MFMA_MOPS_I8' in df.columns:
         peaks['i8_mfma'] = _lookup_peak(df_bw, 'int8', ' mfma', arch_col)
+    # The F6F4 counter aggregates both FP4 and FP6 MFMA ops; use the FP4 MFMA peak
+    # (slightly higher than FP6) as the achievable upper bound.
+    if 'SQ_INSTS_VALU_MFMA_MOPS_F6F4' in df.columns:
+        fp4_mfma_row = df_bw.loc[
+            (df_bw['Datatype'] == 'fp4') & (df_bw['Operation'] == ' mfma'), arch_col
+        ]
+        if not fp4_mfma_row.empty and pd.notna(fp4_mfma_row.values[0]):
+            peaks['f6f4_mfma'] = fp4_mfma_row.values[0]
     peaks['fp16_mfma'] = _lookup_peak(df_bw, 'fp16', ' mfma', arch_col)
     peaks['bf16_mfma'] = _lookup_peak(df_bw, 'bf16', ' mfma', arch_col)
     peaks['fp32_mfma'] = _lookup_peak(df_bw, 'fp32', ' mfma', arch_col)
@@ -225,6 +236,8 @@ def _compute_kernel_peak(df, peaks):
         weighted_time += df['TOTAL_MOPS_F8'] / peaks['fp8_mfma']
     if 'i8_mfma' in peaks:
         weighted_time += df['TOTAL_MOPS_I8'] / peaks['i8_mfma']
+    if 'f6f4_mfma' in peaks and 'TOTAL_MOPS_F6F4' in df.columns:
+        weighted_time += df['TOTAL_MOPS_F6F4'] / peaks['f6f4_mfma']
 
     return ((df['TOTAL_OPS'] - df['TOTAL_SALU']) / weighted_time).replace(np.inf, 0)
 
@@ -380,6 +393,9 @@ def _compute_weighted_jkl_alpha(df, peaks, arch, sweep):
         add_term("fp8_mfma", df["TOTAL_MOPS_F8"] / peaks["fp8_mfma"])
     if "i8_mfma" in peaks and "TOTAL_MOPS_I8" in df.columns:
         add_term("int8_mfma", df["TOTAL_MOPS_I8"] / peaks["i8_mfma"])
+    # FP6/FP4 MFMA ops use the FP4 MFMA peak; the alpha summary CSVs label this as fp4_mfma.
+    if "f6f4_mfma" in peaks and "TOTAL_MOPS_F6F4" in df.columns:
+        add_term("fp4_mfma", df["TOTAL_MOPS_F6F4"] / peaks["f6f4_mfma"])
 
     if not terms:
         return pd.Series(0.0, index=df.index)
@@ -494,6 +510,8 @@ def compute_flops(df, arch):
         new_columns['TOTAL_MOPS_F8'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F8']
     if 'SQ_INSTS_VALU_MFMA_MOPS_I8' in df.columns:
         new_columns['TOTAL_MOPS_I8'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_I8']
+    if 'SQ_INSTS_VALU_MFMA_MOPS_F6F4' in df.columns:
+        new_columns['TOTAL_MOPS_F6F4'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F6F4']
 
     # Other VALU Ops (e.g. Int16, Int8)
     if 'SQ_INSTS_VALU' in df.columns:
@@ -510,6 +528,8 @@ def compute_flops(df, arch):
         TOTAL_OPS = TOTAL_OPS + df['TOTAL_MOPS_F8']
     if 'SQ_INSTS_VALU_MFMA_MOPS_I8' in df.columns:
         TOTAL_OPS = TOTAL_OPS + df['TOTAL_MOPS_I8']
+    if 'SQ_INSTS_VALU_MFMA_MOPS_F6F4' in df.columns:
+        TOTAL_OPS = TOTAL_OPS + df['TOTAL_MOPS_F6F4']
 
     new_columns = {}
     new_columns['TOTAL_OPS'] = TOTAL_OPS
@@ -2175,6 +2195,8 @@ def extract(
                 inst_mix.append(("FP8 MFMA", row['TOTAL_MOPS_F8']))
             if 'TOTAL_MOPS_I8' in row.index:
                 inst_mix.append(("I8 MFMA", row['TOTAL_MOPS_I8']))
+            if 'TOTAL_MOPS_F6F4' in row.index:
+                inst_mix.append(("F6F4 MFMA", row['TOTAL_MOPS_F6F4']))
             if 'TOTAL_VALU_OTHER' in row.index:
                 inst_mix.append(("Other VALU", row['TOTAL_VALU_OTHER']))
             total_ops = sum(ops for _, ops in inst_mix)
