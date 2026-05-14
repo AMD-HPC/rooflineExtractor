@@ -113,6 +113,26 @@ def _safe_divide(numerator, denominator):
     return numerator.divide(denominator).replace(np.inf, 0).replace(np.nan, 0)
 
 
+def _format_throughput(gflops):
+    """Format a throughput in GFLOPs/s; switch to TFLOPs/s when >= 1 TFLOPs/s."""
+    x = float(pd.to_numeric(gflops, errors="coerce"))
+    if not np.isfinite(x):
+        return "N/A"
+    if abs(x) >= 1000.0:
+        return f"{x / 1000:.3f} TFLOPs/s"
+    return f"{x:.3f} GFLOPs/s"
+
+
+def _format_bandwidth(gb_per_s):
+    """Format a bandwidth in GB/s; switch to TB/s when >= 1 TB/s."""
+    x = float(pd.to_numeric(gb_per_s, errors="coerce"))
+    if not np.isfinite(x):
+        return "N/A"
+    if abs(x) >= 1000.0:
+        return f"{x / 1000:.3f} TB/s"
+    return f"{x:.3f} GB/s"
+
+
 def _format_byte_size(n):
     """Format a byte count using B, KB, MB, or GB (1024-based); TB if needed."""
     x = float(pd.to_numeric(n, errors="coerce"))
@@ -465,7 +485,27 @@ def _safe_limiters(masked_df, strip_len, limiter_suffix):
     has_any = ~all_na
     if has_any.any():
         idx.loc[has_any] = masked_df.loc[has_any].idxmin(axis=1)
-    return (idx.str[:-strip_len] + limiter_suffix).fillna("Unknown" + limiter_suffix)
+    base = idx.str[:-strip_len]
+    # The fixed-length strip leaves residual `_PEAK_L` on linear-roof labels (e.g.
+    # `HBM_BW_PEAK_LINEAR` → `HBM_BW_PEAK_L` after stripping `_PEAK`). Trim it so
+    # linear-limiter labels read as e.g. `HBM_BW` rather than `HBM_BW_PEAK_L`.
+    base = base.str.replace(r"_PEAK_L$", "", regex=True)
+    return (base + limiter_suffix).fillna("Unknown" + limiter_suffix)
+
+
+_MEMORY_LIMITER_LEVELS = ("HBM", "L2", "vL1d", "LDS")
+
+
+def _limiter_memory_level(limiter_str):
+    """Return the memory level ('HBM', 'L2', 'vL1d', 'LDS') if `limiter_str` is a memory-bandwidth
+    roof label (e.g. 'HBM_BW (gfx942)'), otherwise None."""
+    if not isinstance(limiter_str, str) or not limiter_str:
+        return None
+    tag = limiter_str.split()[0]
+    for level in _MEMORY_LIMITER_LEVELS:
+        if tag.startswith(f"{level}_BW"):
+            return level
+    return None
 
 
 def _align_curved_limiter_with_linear_compute(limiter, limiter_linear):
@@ -2121,99 +2161,140 @@ def extract(
     # Guided analysis
     print(f"Total unique kernels: {len(df)}")
     print(f"Total kernel dispatches: {len(df_roof)}")
+    print()
+
     for index, row in df.iterrows():  # loop through each kernel
         if row['Percentage'] < sigRuntime:
             continue
-        print("\n" + index)
+        print(f"\033[1m{index}\033[0m")
         print(f"  Total contribution to GPU time: {round(row['Percentage'], 3)} %")
         print(f"  Total runtime (all dispatches):", "{:.3e}".format(row['RuntimeNs']), "ns ({:.3f} s)".format(row['RuntimeNs'] / 1e9))
-        print(f"  Average runtime per dispatch:  ", "{:.3e}".format(row['AverageNs']), "ns ({:.3f} ms)".format(row['AverageNs'] / 1e6))
-        print(f"  Total dispatches:               {int(row['Count'])}")
-
+        print("  Average runtime per dispatch:".ljust(33), "{:.3e}".format(row['AverageNs']), "ns ({:.3f} ms)".format(row['AverageNs'] / 1e6))
+        print("  Total dispatches:".ljust(33), int(row['Count']))
         print()
 
-        print(f"  Total operations per dispatch: ", "{:.3e}".format(row['TOTAL_OPS']), "ops")
-
+        print("  Total operations per dispatch:".ljust(33), "{:.3e}".format(row['TOTAL_OPS']), "FLOPs")
         print()
 
-        print(f"  Total bytes moved (HBM):        {_format_byte_size(row['BW_HBM'])}")
-        print(f"  Total bytes moved (L2):         {_format_byte_size(row['BW_L2'])}")
-        print(f"  Total bytes moved (L1):         {_format_byte_size(row['BW_vL1d'])}")
-        print(f"  Total bytes moved (LDS):        {_format_byte_size(row['BW_LDS'])}")
-
+        print("  Total bytes moved (HBM):".ljust(33), _format_byte_size(row['BW_HBM']))
+        print("  Total bytes moved (L2):".ljust(33), _format_byte_size(row['BW_L2']))
+        print("  Total bytes moved (L1):".ljust(33), _format_byte_size(row['BW_vL1d']))
+        print("  Total bytes moved (LDS):".ljust(33), _format_byte_size(row['BW_LDS']))
         print()
 
-        print(f"  Arithmetic intensity (HBM):    ", round(row['AI_HBM_TOT'], 4))
-        print(f"  Arithmetic intensity (L2):     ", round(row['AI_L2_TOT'], 4))
-        print(f"  Arithmetic intensity (L1):     ", round(row['AI_vL1d_TOT'], 4))
-        print(f"  Arithmetic intensity (LDS):    ", round(row['AI_LDS_TOT'], 4))
+        print("  Arithmetic intensity (HBM):".ljust(33), round(row['AI_HBM_TOT'], 4), " FLOPs/B")
+        print("  Arithmetic intensity (L2):".ljust(33), round(row['AI_L2_TOT'], 4), " FLOPs/B")
+        print("  Arithmetic intensity (L1):".ljust(33), round(row['AI_vL1d_TOT'], 4), " FLOPs/B")
+        print("  Arithmetic intensity (LDS):".ljust(33), round(row['AI_LDS_TOT'], 4), " FLOPs/B")
+        print()
 
-        if curved_avail:
-            print()
-            print(
-                f"  Linear roofline performance limiter:  ",
-                row["LIMITER_LINEAR"],
-            )
-            print(
-                f"  Linear roofline peak throughput:      ",
-                round(row["PEAK_LINEAR"], 2),
-                "GFLOPS/s",
-            )
-            print(
-                f"  Percent of linear roofline achieved:  ",
-                round(row["PercentAchieved_LINEAR"], 4),
-                "%",
-            )
-
-        _roof_label = "Curved" if curved_avail else "Linear"
-        print(f"\n  {_roof_label} performance limiter:           ", row['LIMITER'])
-        print(f"  {_roof_label} roofline peak throughput:      ", round(row['PEAK'], 2), "GFLOPS/s")
-        print(f"  Percent of {_roof_label.lower()} roofline achieved:  ", round(row['PercentAchieved'], 4), "%")
         if 'KERNEL_COMPUTE' in row['LIMITER']:
             inst_mix = [
-                ("FP16 Add",    64 * row['SQ_INSTS_VALU_ADD_F16']),
-                ("FP16 Mul",    64 * row['SQ_INSTS_VALU_MUL_F16']),
-                ("FP16 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F16']),
-                ("FP16 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F16']),
-                ("FP32 Add",    64 * row['SQ_INSTS_VALU_ADD_F32']),
-                ("FP32 Mul",    64 * row['SQ_INSTS_VALU_MUL_F32']),
-                ("FP32 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F32']),
-                ("FP32 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F32']),
-                ("FP64 Add",    64 * row['SQ_INSTS_VALU_ADD_F64']),
-                ("FP64 Mul",    64 * row['SQ_INSTS_VALU_MUL_F64']),
-                ("FP64 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F64']),
-                ("FP64 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F64']),
-                ("INT32",       row['TOTAL_VALU_I32']),
-                ("INT64",       row['TOTAL_VALU_I64']),
-                ("FP16 MFMA",   row['TOTAL_MOPS_F16']),
-                ("BF16 MFMA",   row['TOTAL_MOPS_BF16']),
-                ("FP32 MFMA",   row['TOTAL_MOPS_F32']),
-                ("FP64 MFMA",   row['TOTAL_MOPS_F64']),
-                ("SALU",        row['TOTAL_SALU']),
+                ("FP16 Add",    64 * row['SQ_INSTS_VALU_ADD_F16'],     _peaks_agg.get('fp16_add')),
+                ("FP16 Mul",    64 * row['SQ_INSTS_VALU_MUL_F16'],     _peaks_agg.get('fp16_mul')),
+                ("FP16 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F16'], _peaks_agg.get('fp16_muladd')),
+                ("FP16 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F16'],   _peaks_agg.get('fp16_trans')),
+                ("FP32 Add",    64 * row['SQ_INSTS_VALU_ADD_F32'],     _peaks_agg.get('fp32_add')),
+                ("FP32 Mul",    64 * row['SQ_INSTS_VALU_MUL_F32'],     _peaks_agg.get('fp32_mul')),
+                ("FP32 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F32'], _peaks_agg.get('fp32_muladd')),
+                ("FP32 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F32'],   _peaks_agg.get('fp32_trans')),
+                ("FP64 Add",    64 * row['SQ_INSTS_VALU_ADD_F64'],     _peaks_agg.get('fp64_add')),
+                ("FP64 Mul",    64 * row['SQ_INSTS_VALU_MUL_F64'],     _peaks_agg.get('fp64_mul')),
+                ("FP64 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F64'], _peaks_agg.get('fp64_muladd')),
+                ("FP64 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F64'],   _peaks_agg.get('fp64_trans')),
+                ("INT32",       row['TOTAL_VALU_I32'],                 _peaks_agg.get('int32')),
+                ("INT64",       row['TOTAL_VALU_I64'],                 _peaks_agg.get('int64')),
+                ("FP16 MFMA",   row['TOTAL_MOPS_F16'],                 _peaks_agg.get('fp16_mfma')),
+                ("BF16 MFMA",   row['TOTAL_MOPS_BF16'],                _peaks_agg.get('bf16_mfma')),
+                ("FP32 MFMA",   row['TOTAL_MOPS_F32'],                 _peaks_agg.get('fp32_mfma')),
+                ("FP64 MFMA",   row['TOTAL_MOPS_F64'],                 _peaks_agg.get('fp64_mfma')),
+                ("SALU",        row['TOTAL_SALU'],                     None),
             ]
             if 'TOTAL_MOPS_F8' in row.index:
-                inst_mix.append(("FP8 MFMA", row['TOTAL_MOPS_F8']))
+                inst_mix.append(("FP8 MFMA", row['TOTAL_MOPS_F8'], _peaks_agg.get('fp8_mfma')))
             if 'TOTAL_MOPS_I8' in row.index:
-                inst_mix.append(("I8 MFMA", row['TOTAL_MOPS_I8']))
+                inst_mix.append(("I8 MFMA", row['TOTAL_MOPS_I8'], _peaks_agg.get('i8_mfma')))
             if 'TOTAL_MOPS_F6F4' in row.index:
-                inst_mix.append(("F6F4 MFMA", row['TOTAL_MOPS_F6F4']))
+                inst_mix.append(("F6F4 MFMA", row['TOTAL_MOPS_F6F4'], _peaks_agg.get('f6f4_mfma')))
             if 'TOTAL_VALU_OTHER' in row.index:
-                inst_mix.append(("Other VALU", row['TOTAL_VALU_OTHER']))
-            total_ops = sum(ops for _, ops in inst_mix)
+                inst_mix.append(("Other VALU", row['TOTAL_VALU_OTHER'], _peaks_agg.get('other')))
+            total_ops = sum(ops for _, ops, _ in inst_mix)
             if total_ops > 0:
-                inst_mix = [(label, ops / total_ops * 100) for label, ops in inst_mix if ops > 0]
+                inst_mix = [
+                    (label, ops / total_ops * 100, peak)
+                    for label, ops, peak in inst_mix
+                    if ops > 0
+                ]
                 inst_mix.sort(key=lambda x: x[1], reverse=True)
+                print("  Instruction mix:".ljust(33), "(roofline peak)")
+                for label, pct, peak in inst_mix:
+                    if peak is None or not np.isfinite(peak) or peak <= 0:
+                        peak_str = "N/A"
+                    else:
+                        peak_str = f"{peak / 1000:.1f} TFLOPs/s"
+                    print(f"    {label + ':':20s} {pct:5.1f}%   ({peak_str})")
                 print()
-                print(f"  Instruction mix:")
-                for label, pct in inst_mix:
-                    print(f"    {label + ':':20s} {pct:5.1f}%")
 
         # Calculate achieved
         achieved = row['Throughput']
-        print(f"\n  Achieved throughput:           ", round(achieved, 2), "GFLOPS/s (weighted average)")
+        print("  Achieved throughput:".ljust(40), _format_throughput(achieved))
+        _mem_levels = []
+        for _lim in (row['LIMITER'], row.get('LIMITER_LINEAR')):
+            _lvl = _limiter_memory_level(_lim)
+            if _lvl is not None and _lvl not in _mem_levels:
+                _mem_levels.append(_lvl)
+        for _lvl in _mem_levels:
+            _achieved_bw = row[f"BW_{_lvl}"] / row["AverageNs"]
+            print(
+                f"  Achieved {_lvl} bandwidth:".ljust(40),
+                _format_bandwidth(_achieved_bw),
+            )
+        print()
 
-    print(f"\n{insigKernels} kernels omitted from CLI output for having less than {sigRuntime} percent GPU time (use --sig-runtime to change threshold)")
-    print(f"\nTotal application GPU time on {arch}: {df_runtime['DurationNs'].sum():.2e} ns ({df_runtime['DurationNs'].sum()/1e9:.6f} s)")
+        if curved_avail:
+            print(
+                "  Linear roofline performance limiter:".ljust(40),
+                row["LIMITER_LINEAR"],
+            )
+            print(
+                "  Linear roofline peak throughput:".ljust(40),
+                _format_throughput(row["PEAK_LINEAR"]),
+            )
+            _lin_mem_level = _limiter_memory_level(row["LIMITER_LINEAR"])
+            if _lin_mem_level is not None:
+                print(
+                    f"  Linear roofline peak {_lin_mem_level} bandwidth:".ljust(40),
+                    _format_bandwidth(caches[arch][_lin_mem_level]),
+                )
+            print(
+                "  Percent of linear roofline achieved:".ljust(40),
+                round(row["PercentAchieved_LINEAR"], 4),
+                "%",
+            )
+            print()
+
+        _roof_label = "Curved" if curved_avail else "Linear"
+        print(f"  {_roof_label} performance limiter:".ljust(40), row['LIMITER'])
+        print(f"  {_roof_label} roofline peak throughput:".ljust(40), _format_throughput(row['PEAK']))
+        _mem_level = _limiter_memory_level(row['LIMITER'])
+        if _mem_level is not None:
+            _ai = float(pd.to_numeric(row.get(f"AI_{_mem_level}_TOT"), errors="coerce"))
+            _peak_thr = float(pd.to_numeric(row.get(f"{_mem_level}_BW_PEAK"), errors="coerce"))
+            if np.isfinite(_ai) and _ai > 0 and np.isfinite(_peak_thr):
+                _peak_bw = _peak_thr / _ai
+            else:
+                _peak_bw = float("nan")
+            print(
+                f"  {_roof_label} roofline peak {_mem_level} bandwidth:".ljust(40),
+                _format_bandwidth(_peak_bw),
+            )
+        print(f"  Percent of {_roof_label.lower()} roofline achieved:".ljust(40), round(row['PercentAchieved'], 4), "%")
+        print()
+
+    print(f"\033[1m{insigKernels} kernels omitted from CLI output for having less than {sigRuntime} percent GPU time (use --sig-runtime to change threshold)\033[0m")
+    print()
+
+    print(f"Total application GPU time on {arch}: {df_runtime['DurationNs'].sum():.2e} ns ({df_runtime['DurationNs'].sum()/1e9:.6f} s)")
     print()
 
     df_roof['Percentage'] = df_roof['DurationNs']/sum(totalRuntimes) * 100
