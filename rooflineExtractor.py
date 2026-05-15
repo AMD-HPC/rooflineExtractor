@@ -293,8 +293,13 @@ def _load_peaks(df_bw, arch_col, df):
     ]
     peaks['fp64_mfma'] = fp64_mfma_row.values[0] if not fp64_mfma_row.empty else 0
 
-    # INT32 Mul is the best performing test that hardware counters recognize as INT32
-    peaks['int32'] = _lookup_peak(df_bw, 'int32', ' Mul', arch_col)
+    # INT32 peak is the best of the int32 Add and int32 Mul benchWarmer tests, since both
+    # are recognized by the hardware counters as INT32 ops and the achieved throughput
+    # can differ between adds and multiplies on a given arch.
+    peaks['int32'] = max(
+        _lookup_peak(df_bw, 'int32', ' Add', arch_col),
+        _lookup_peak(df_bw, 'int32', ' Mul', arch_col),
+    )
     # INT32 MulAdd is the best performing test that hardware counters recognize as INT64; divide by 2 for GInsts/s
     peaks['int64'] = _lookup_peak(df_bw, 'int32', ' MulAdd', arch_col) / 2
     # Assume 'other' operations are int8 left shifts (best performing operation without a dedicated counter)
@@ -603,6 +608,53 @@ def _align_curved_limiter_with_linear_compute(limiter, limiter_linear):
 
 # Compute total flops, AI's
 def compute_flops(df, arch):
+    # Drop dispatches whose VALU counters are inconsistent across PMC passes.
+    # SQ_INSTS_VALU is captured in a different PMC counter-collection run than the typed
+    # counters (SQ_INSTS_VALU_ADD_*, _MUL_*, _FMA_*, _TRANS_*, _INT32, _INT64). The
+    # leftover 64 * (SQ_INSTS_VALU - typed_sum) represents bitwise ops not
+    # captured by the typed counters and must be >= 0. A negative leftover means one of
+    # the PMC counter-collection files is corrupted/inconsistent for that dispatch
+    # (typically the SQ_INSTS_VALU pass came back as 0). Drop those dispatches with a
+    # warning so they don't poison TOTAL_OPS, the kernel compute peak, and the achieved-% ratio.
+    if 'SQ_INSTS_VALU' in df.columns:
+        _valu_typed_sum = (
+            df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + df['SQ_INSTS_VALU_FMA_F16']
+            + df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + df['SQ_INSTS_VALU_FMA_F32']
+            + df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + df['SQ_INSTS_VALU_FMA_F64']
+            + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64']
+        )
+        _valu_other_raw = 64 * (df['SQ_INSTS_VALU'] - _valu_typed_sum)
+        _corrupt_mask = _valu_other_raw < 0
+        if _corrupt_mask.any():
+            _bad = df.loc[_corrupt_mask].copy()
+            _bad['__VALU_LEFTOVER'] = _valu_other_raw.loc[_corrupt_mask]
+            _kernel_col = 'Kernel_Name' if 'Kernel_Name' in _bad.columns else (
+                'KernelName' if 'KernelName' in _bad.columns else None
+            )
+            _id_col = 'Dispatch_Id' if 'Dispatch_Id' in _bad.columns else (
+                'Index' if 'Index' in _bad.columns else None
+            )
+            print(
+                f"WARNING: {int(_corrupt_mask.sum())}/{len(df)} dispatch(es) have "
+                f"SQ_INSTS_VALU < sum of typed VALU counters, indicating one of the "
+                f"counter-collection PMC files is corrupted for these dispatches. "
+                f"Dropping them from analysis."
+            )
+            _max_listed = 10
+            _to_show = _bad.head(_max_listed)
+            for _, _r in _to_show.iterrows():
+                _id_str = f"Dispatch {int(_r[_id_col])}" if _id_col is not None else "<unknown id>"
+                _kn_str = str(_r[_kernel_col]) if _kernel_col is not None else "<unknown kernel>"
+                _valu = float(_r.get('SQ_INSTS_VALU', float('nan')))
+                _typed = _valu - float(_r['__VALU_LEFTOVER']) / 64.0
+                print(
+                    f"  - {_id_str}: SQ_INSTS_VALU={int(_valu)}, "
+                    f"typed_sum={int(_typed)}, leftover={int(_r['__VALU_LEFTOVER'])} ({_kn_str})"
+                )
+            if int(_corrupt_mask.sum()) > _max_listed:
+                print(f"  ... and {int(_corrupt_mask.sum()) - _max_listed} more")
+            df = df.loc[~_corrupt_mask].copy()
+
     # Create a dictionary to store all new columns
     new_columns = {}
 
@@ -629,9 +681,18 @@ def compute_flops(df, arch):
     if 'SQ_INSTS_VALU_MFMA_MOPS_F6F4' in df.columns:
         new_columns['TOTAL_MOPS_F6F4'] = 512 * df['SQ_INSTS_VALU_MFMA_MOPS_F6F4']
 
-    # Other VALU Ops (e.g. Int16, Int8)
+    # Other VALU Ops (e.g. bitwise ops, INT16). Corrupted dispatches (where this leftover would
+    # be negative) were dropped at the top of compute_flops, so this is guaranteed >= 0.
     if 'SQ_INSTS_VALU' in df.columns:
-        new_columns['TOTAL_VALU_OTHER'] = 64 * (df['SQ_INSTS_VALU'] - (df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + df['SQ_INSTS_VALU_FMA_F16'] + df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + df['SQ_INSTS_VALU_FMA_F32'] + df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + df['SQ_INSTS_VALU_FMA_F64'] + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64']))
+        new_columns['TOTAL_VALU_OTHER'] = 64 * (
+            df['SQ_INSTS_VALU']
+            - (
+                df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + df['SQ_INSTS_VALU_FMA_F16']
+                + df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + df['SQ_INSTS_VALU_FMA_F32']
+                + df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + df['SQ_INSTS_VALU_FMA_F64']
+                + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64']
+            )
+        )
 
     # Concat first batch of columns
     df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
@@ -2703,8 +2764,21 @@ def extract(
     _pct = df_roof['Percentage'].astype(float)
     _pa = df_roof['PercentAchieved']
     _pa_linear = df_roof['PercentAchieved_LINEAR']
-    _w = _pct.notna() & _pa.notna() & (_pct > 0)
-    _w_linear = _pct.notna() & _pa_linear.notna() & (_pct > 0)
+    # Drop rows whose PEAK collapsed to the eps floor in _hbm_roof_throughput / clip(eps).
+    # Those rows contribute astronomically large achieved-% values (throughput / 1e-30)
+    # that swamp the weighted average. The floor only triggers when input counters are
+    # missing or inconsistent for that dispatch, so excluding them gives a representative
+    # number rather than NaN/inf. Use a generous floor (1e-12) so we drop exactly the
+    # sentinel rows without affecting legitimately-tiny peaks.
+    _peak_floor = 1e-12
+    _peak = df_roof['PEAK'].astype(float)
+    _peak_linear = df_roof['PEAK_LINEAR'].astype(float)
+    _valid_peak = _peak.notna() & (_peak > _peak_floor)
+    _valid_peak_linear = _peak_linear.notna() & (_peak_linear > _peak_floor)
+    _w = _pct.notna() & _pa.notna() & (_pct > 0) & _valid_peak
+    _w_linear = _pct.notna() & _pa_linear.notna() & (_pct > 0) & _valid_peak_linear
+    _dropped = int((_pct.notna() & _pa.notna() & (_pct > 0) & ~_valid_peak).sum())
+    _dropped_linear = int((_pct.notna() & _pa_linear.notna() & (_pct > 0) & ~_valid_peak_linear).sum())
     if _w.any():
         roofline_percentage = (_pct[_w] * _pa[_w]).sum() / _pct[_w].sum()
     else:
@@ -2713,6 +2787,12 @@ def extract(
         roofline_percentage_linear = (_pct[_w_linear] * _pa_linear[_w_linear]).sum() / _pct[_w_linear].sum()
     else:
         roofline_percentage_linear = float("nan")
+    if _dropped or _dropped_linear:
+        print(
+            "Note: excluded dispatch(es) with degenerate roofline peaks "
+            f"(missing/inconsistent counters) from the average percent calculations: "
+            f"curved={_dropped}, linear={_dropped_linear}."
+        )
     if curved_avail:
         print(f"Average percent of linear roofline achieved: {roofline_percentage_linear:.3f} %")
         print(f"Average percent of curved roofline achieved: {roofline_percentage:.3f} %")
