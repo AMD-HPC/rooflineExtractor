@@ -260,6 +260,11 @@ def _lookup_peak(df_bw, datatype, operation, arch_col):
     ].values[0]
 
 
+def _default_flat_compute_peak(peaks):
+    """Default flat compute roof (FP64 MFMA) for the roofline plot."""
+    return peaks['fp64_mfma']
+
+
 def _load_peaks(df_bw, arch_col, df):
     """Load all peak throughput values for a given architecture from benchWarmer data."""
     peaks = {}
@@ -384,10 +389,10 @@ def _load_hbm_alpha_by_label(arch):
     return _load_jkl_alpha_by_label(arch, "hbm")
 
 
-def _default_hbm_alpha_fp32_fma(arch):
-    """Alpha for 100% FP32 MulAdd (FMA) from HBM table (for default, non-kernel roofline)."""
+def _default_hbm_alpha_fp64_mfma(arch):
+    """Alpha for 100% FP64 MFMA from HBM table (for default, non-kernel roofline)."""
     m = _load_hbm_alpha_by_label(arch)
-    return m.get("fp32_muladd")
+    return m.get("fp64_mfma")
 
 
 def _use_lds_alpha_model(arch):
@@ -397,10 +402,10 @@ def _use_lds_alpha_model(arch):
     return len(_load_jkl_alpha_by_label(arch, "lds")) > 0
 
 
-def _default_lds_alpha_fp32_fma(arch):
-    """Alpha for 100% FP32 MulAdd (FMA) from LDS table (default roofline when no kernel selected)."""
+def _default_lds_alpha_fp64_mfma(arch):
+    """Alpha for 100% FP64 MFMA from LDS table (default roofline when no kernel selected)."""
     m = _load_jkl_alpha_by_label(arch, "lds")
-    return m.get("fp32_muladd")
+    return m.get("fp64_mfma")
 
 
 def _term_time(ops_over_peak):
@@ -718,7 +723,7 @@ def compute_flops(df, arch):
     # Calculate kernel-specific compute peak for current architecture
     new_columns = {}
     new_columns['KERNEL_COMPUTE_PEAK'] = _compute_kernel_peak(df, peaks)
-    new_columns['COMPUTE_PEAK'] = peaks['fp32_muladd']
+    new_columns['COMPUTE_PEAK'] = _default_flat_compute_peak(peaks)
 
     # Concat compute peak columns
     df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
@@ -1195,15 +1200,15 @@ __D3_SCRIPT__
     if (hbmAlphaOn && cacheKey === "HBM") {
       if (kernelHbmAlpha() != null) {
         lines.push("α: instruction-mix weighted (hovered or selected kernel).");
-      } else if (meta.defaultHbmAlphaFp32Fma != null && Number.isFinite(meta.defaultHbmAlphaFp32Fma)) {
-        lines.push("α: FP32 MulAdd (FMA) microbenchmark (100% FMA default).");
+      } else if (meta.defaultHbmAlphaFp64Mfma != null && Number.isFinite(meta.defaultHbmAlphaFp64Mfma)) {
+        lines.push("α: FP64 MFMA microbenchmark (100% MFMA default).");
       }
       lines.push(computeRoofFlatDisclaimer());
     } else if (ldsAlphaOn && cacheKey === "LDS") {
       if (kernelLdsAlpha() != null) {
         lines.push("α: instruction-mix weighted (hovered or selected kernel).");
-      } else if (meta.defaultLdsAlphaFp32Fma != null && Number.isFinite(meta.defaultLdsAlphaFp32Fma)) {
-        lines.push("α: FP32 MulAdd (FMA) microbenchmark (100% FMA default).");
+      } else if (meta.defaultLdsAlphaFp64Mfma != null && Number.isFinite(meta.defaultLdsAlphaFp64Mfma)) {
+        lines.push("α: FP64 MFMA microbenchmark (100% MFMA default).");
       }
       lines.push(computeRoofFlatDisclaimer());
     } else if (roofHoverDispatchComputePeak != null) {
@@ -1213,7 +1218,7 @@ __D3_SCRIPT__
     } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
       lines.push("(Instruction-mix ceiling for selected kernel)");
     } else {
-      lines.push("Compute peak is currently drawn according to FP32 FMA, not kernel-specific instruction mix.");
+      lines.push("Compute peak is currently drawn according to FP64 MFMA, not kernel-specific instruction mix.");
     }
     return lines.join(nl);
   }
@@ -1335,7 +1340,7 @@ __D3_SCRIPT__
         return "(Compute roof: instruction-mix ceiling for selected kernel.)";
       }
     }
-    return "(Compute roof: FP32 FMA baseline, or kernel mix when hovered/selected.)";
+    return "(Compute roof: FP64 MFMA baseline, or kernel mix when hovered/selected.)";
   }
 
   function kernelHbmAlpha() {
@@ -1375,8 +1380,8 @@ __D3_SCRIPT__
     if (k != null) {
       return k;
     }
-    if (meta.useHbmAlphaModel === true && meta.defaultHbmAlphaFp32Fma != null && Number.isFinite(meta.defaultHbmAlphaFp32Fma)) {
-      return { alpha: meta.defaultHbmAlphaFp32Fma };
+    if (meta.useHbmAlphaModel === true && meta.defaultHbmAlphaFp64Mfma != null && Number.isFinite(meta.defaultHbmAlphaFp64Mfma)) {
+      return { alpha: meta.defaultHbmAlphaFp64Mfma };
     }
     return null;
   }
@@ -1386,8 +1391,8 @@ __D3_SCRIPT__
     if (k != null) {
       return k;
     }
-    if (meta.useLdsAlphaModel === true && meta.defaultLdsAlphaFp32Fma != null && Number.isFinite(meta.defaultLdsAlphaFp32Fma)) {
-      return { alpha: meta.defaultLdsAlphaFp32Fma };
+    if (meta.useLdsAlphaModel === true && meta.defaultLdsAlphaFp64Mfma != null && Number.isFinite(meta.defaultLdsAlphaFp64Mfma)) {
+      return { alpha: meta.defaultLdsAlphaFp64Mfma };
     }
     return null;
   }
@@ -1497,9 +1502,33 @@ __D3_SCRIPT__
     });
   }
 
+  function computeKernelsVisibleAtThreshold() {
+    const t = th[thresholdIndex];
+    const key = regionKey();
+    const agg = currentMode().aggregate;
+    const src = agg ? data.aggregate : data.dispatch;
+    const visible = new Set();
+    for (let i = 0; i < src.length; i++) {
+      const d = src[i];
+      const c = d.cumulativePct;
+      if (c == null || !Number.isFinite(c) || c > t) continue;
+      const a = d.ai[key];
+      if (a == null || !(a > 0) || !Number.isFinite(a)) continue;
+      const tp = d.throughput;
+      if (tp == null || !(tp > 0) || !Number.isFinite(tp)) continue;
+      visible.add(d.kernelName);
+    }
+    return visible;
+  }
+
   function updateKernelLegendUI() {
+    const visibleKernels = computeKernelsVisibleAtThreshold();
+    const totalCount = kLeg.length;
+    const shownCount = visibleKernels.size;
     if (kHead) {
-      let t = "Kernels (" + kLeg.length + ")";
+      let t = shownCount < totalCount
+        ? "Kernels (" + shownCount + " / " + totalCount + ")"
+        : "Kernels (" + totalCount + ")";
       if (kernelFilterActive()) {
         t += " — " + selectedKernelNames.size + " selected";
       }
@@ -1510,6 +1539,8 @@ __D3_SCRIPT__
       kUl.querySelectorAll("li").forEach(function(li) {
         const name = li._kernelName;
         if (!name) return;
+        const inThreshold = visibleKernels.has(name);
+        li.style.display = inThreshold ? "" : "none";
         const on = selectedKernelNames.has(name);
         const active = kernelFilterActive();
         li.classList.toggle("kernel-legend-selected", on);
@@ -1591,7 +1622,6 @@ __D3_SCRIPT__
     });
     kUl.appendChild(li);
   });
-  updateKernelLegendUI();
 
   if (kClear) {
     kClear.addEventListener("click", function() {
@@ -1636,6 +1666,8 @@ __D3_SCRIPT__
   slider.max = String(Math.max(0, th.length - 1));
   slider.value = "0";
   const thLabel = document.getElementById("threshold-label");
+
+  updateKernelLegendUI();
 
   function isDarkTheme() {
     return document.documentElement.classList.contains("theme-dark");
@@ -1799,20 +1831,27 @@ __D3_SCRIPT__
     const key = d.memRegion || regionKey();
     const rawAi = d.ai[key];
     const aiVal = rawAi != null && Number.isFinite(rawAi) ? rawAi : "N/A";
-    const pctRoof = d.percentAchieved != null && Number.isFinite(d.percentAchieved)
-      ? d.percentAchieved.toFixed(4) + " %"
-      : "N/A";
     const aiLabel = d.memRegion ? ("AI (" + d.memRegion + "): ") : "AI: ";
     const m = currentMode();
     const nl = String.fromCharCode(10);
-    const peakStr = tooltipPeakForDot(d).toFixed(3);
+    const peakVal = tooltipPeakForDot(d);
+    const peakStr = Number.isFinite(peakVal) ? peakVal.toFixed(3) : "N/A";
+    // Recompute percent against the currently shown roof so curved/linear toggle is reflected.
+    const pctRoof = (Number.isFinite(peakVal) && peakVal > 0
+                     && d.throughput != null && Number.isFinite(d.throughput))
+      ? (d.throughput / peakVal * 100).toFixed(4) + " %"
+      : "N/A";
+    const alphaCharts = meta.useHbmAlphaModel === true || meta.useLdsAlphaModel === true;
+    const limiterStr = (alphaCharts && !useCurvedHbmLdsRooflines && d.limiterLinear)
+      ? d.limiterLinear
+      : d.limiter;
     const lines = m.aggregate ? [
       "Name: " + d.nameDisplay,
       aiLabel + aiVal,
       "Achieved throughput: " + d.throughput.toFixed(3) + " GFLOPs/s",
-      "Peak throughput: " + d.peak.toFixed(3) + " GFLOPs/s",
+      "Peak throughput: " + peakStr + " GFLOPs/s",
       "Percent of roofline achieved: " + pctRoof,
-      "Performance limiter: " + d.limiter,
+      "Performance limiter: " + limiterStr,
       "Total dispatches: " + d.count,
       "Aggregate percent runtime: " + d.percentage.toFixed(5) + " %"
     ] : [
@@ -1820,9 +1859,9 @@ __D3_SCRIPT__
       "Index: " + d.index + " / " + d.totalKernels,
       aiLabel + aiVal,
       "Achieved throughput: " + d.throughput.toFixed(3) + " GFLOPs/s",
-      "Peak throughput: " + d.peak.toFixed(3) + " GFLOPs/s",
+      "Peak throughput: " + peakStr + " GFLOPs/s",
       "Percent of roofline achieved: " + pctRoof,
-      "Performance limiter: " + d.limiter,
+      "Performance limiter: " + limiterStr,
       "Aggregate percent runtime: " + d.percentageAggregate.toFixed(5) + " %",
       "Individual percent runtime: " + d.percentage.toFixed(5) + " %"
     ];
@@ -1957,6 +1996,7 @@ __D3_SCRIPT__
     disc.style.display = (!m.aggregate && meta.disclaimer) ? "block" : "none";
     drawDots(x, y);
     updateLegend();
+    updateKernelLegendUI();
     updateThresholdLabel();
     refreshDotTooltipIfNeeded();
   }
@@ -2692,7 +2732,10 @@ def extract(
         x_min = 0.001
         x_max = 100000
         y_min = 0.5
-        y_max = 200000
+        if df_plot['PEAK'].max() > 500000:
+            y_max = 2000000
+        else:
+            y_max = 500000
 
         x_vals = np.logspace(np.log10(x_min), np.log10(x_max), 200)
         compute_peak = float(df["COMPUTE_PEAK"].iloc[0])
@@ -2799,7 +2842,7 @@ def extract(
                 if pd.notna(a) and np.isfinite(a):
                     kernel_hbm_alpha_by_name[str(kn)] = {"alpha": float(a)}
 
-        _def_alpha = _default_hbm_alpha_fp32_fma(arch) if use_hbm_alpha else None
+        _def_alpha = _default_hbm_alpha_fp64_mfma(arch) if use_hbm_alpha else None
 
         use_lds_alpha = _use_lds_alpha_model(arch)
         kernel_lds_alpha_by_name = {}
@@ -2809,7 +2852,7 @@ def extract(
                 if pd.notna(a) and np.isfinite(a):
                     kernel_lds_alpha_by_name[str(kn)] = {"alpha": float(a)}
 
-        _def_lds_alpha = _default_lds_alpha_fp32_fma(arch) if use_lds_alpha else None
+        _def_lds_alpha = _default_lds_alpha_fp64_mfma(arch) if use_lds_alpha else None
 
         payload = {
             "meta": {
@@ -2824,10 +2867,10 @@ def extract(
                 "computePeak": _json_safe_float(compute_peak),
                 "useHbmAlphaModel": use_hbm_alpha,
                 "hbmAlphaArch": arch if use_hbm_alpha else None,
-                "defaultHbmAlphaFp32Fma": _json_safe_float(_def_alpha),
+                "defaultHbmAlphaFp64Mfma": _json_safe_float(_def_alpha),
                 "useLdsAlphaModel": use_lds_alpha,
                 "ldsAlphaArch": arch if use_lds_alpha else None,
-                "defaultLdsAlphaFp32Fma": _json_safe_float(_def_lds_alpha),
+                "defaultLdsAlphaFp64Mfma": _json_safe_float(_def_lds_alpha),
             },
             "kernelComputePeakByName": kernel_compute_peak_by_name,
             "kernelHbmAlphaByName": kernel_hbm_alpha_by_name,
