@@ -1,3 +1,7 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc.
+# Use of this source code is governed by an MIT-style license that can be
+# found in the LICENSE file # or at https://opensource.org/licenses/MIT.
+
 #!/usr/bin/env python3
 """
 Script to run rocprofv3 with both counter collection and kernel tracing,
