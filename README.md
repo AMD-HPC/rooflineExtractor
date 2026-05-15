@@ -11,11 +11,11 @@ pip install -r requirements.txt
 The easiest way to use rooflineExtractor is with the `profile_app.py` script, which automates all the profiling steps:
 
 ```bash
-python3 profile_app.py -- <app exe> [args...]
+python3 profile_app.py --arch <ARCH> -- <app exe> [args...]
 ```
 
 This script will:
-1. Automatically detect your GPU architecture (MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X)
+1. Use the GPU architecture you pass via `--arch` (one of MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X) to pick the matching counter input file
 2. Run `rocprofv3` to collect hardware counters (four runs of the application)
 3. Perform post-processing on the counter data
 4. Run `rocprofv3` to collect kernel trace data (one run of the application)
@@ -23,9 +23,11 @@ This script will:
 
 **Note:** The script uses the `-f csv` flag with rocprofv3, which is only available in ROCm 7 and later. If the flag is not recognized, the script will automatically retry without it.
 
+Required flags:
+* `--arch [ARCH]`: Current GPU architecture. Options: MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X
+
 Optional flags:
 * `-o [OUTPUT_DIR]`: Specify output directory (default: `./output/`)
-* `--arch [ARCH]`: Specify current GPU architecture (auto-detected if not provided). Options: MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X
 
 **Example:**
 ```bash
@@ -50,15 +52,17 @@ The following two runs of rocprofv3 are needed to use rooflineExtractor:
     * **Note:** The `-f csv` flag is only recognized in ROCm 7 and later. For older versions, omit this flag.
 
 ### Run rooflineExtractor (single application)
-Provide counter and trace CSVs with **`-c`** and **`-r`**:
+Provide counter and trace CSVs with **`-c`** and **`-r`**, and the GPU architecture with **`--arch`**:
 
-`python3 rooflineExtractor.py -c [roof-counters.csv] -r [trace or results CSV]`
+`python3 rooflineExtractor.py -c [roof-counters.csv] -r [trace or results CSV] --arch [ARCH]`
+
+Required flags:
+* `--arch [ARCH]`: Current GPU architecture. Options: MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X
 
 Additional optional flags:
 * `--plot`: Generate plots
 * `--dump`: Dump per-dispatch and aggregate dataframes to `*_EXTRACTED.csv` and `*_EXTRACTED_AGG.csv` (next to the counter path stem)
 * `--sig-runtime [% runtime]`: Specify what's the minimum percent runtime for a kernel to be considered "significant" and be included in analysis. Defaults to 10%.
-* `--arch [ARCH]`: Specify current GPU architecture (auto-detected if not provided). Options: MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X
 
 ### Multi-application combined analysis (`--directory`)
 

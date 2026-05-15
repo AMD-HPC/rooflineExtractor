@@ -8,16 +8,14 @@ Script to run rocprofv3 with both counter collection and kernel tracing,
 then analyze the results with rooflineExtractor.
 
 Usage:
-    python profile_app.py [-o OUTPUT_DIR] [--arch ARCH] -- <run_command> [args...]
-    
+    python profile_app.py [-o OUTPUT_DIR] --arch ARCH -- <run_command> [args...]
+
 Example:
-    python profile_app.py -- ./my_app arg1 arg2
-    python profile_app.py -o ./results -- ./my_app -v --debug
-    python profile_app.py --arch MI300X -- ./my_app
-    
+    python profile_app.py --arch MI300X -- ./my_app arg1 arg2
+    python profile_app.py -o ./results --arch MI300X -- ./my_app -v --debug
+
 Default output directory is ./data/output/
-If --arch is not provided, the GPU architecture will be auto-detected when
-rocm-smi/rocminfo are available; otherwise you must pass --arch explicitly.
+The --arch flag is required; pass it explicitly to select the GPU architecture.
 
 Note:
     The script attempts to use the -f csv flag with rocprofv3. This flag is not
@@ -180,109 +178,6 @@ def run_rocprofv3_with_retry(cmd_with_csv, cmd_without_csv, cwd, logger=None):
     return result
 
 
-def detect_gpu():
-    """
-    Detect the AMD GPU model running on the system.
-    Returns one of: 'MI250', 'MI250X', 'MI300A', 'MI300X', 'MI325X', 'MI350X', 'MI355X', or None if detection fails.
-    """
-    try:
-        # Try using rocm-smi to get GPU information
-        result = subprocess.run(['rocm-smi', '--showproductname'], 
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False)
-        
-        if result.returncode == 0:
-            output = result.stdout.lower()
-            
-            # Check for specific GPU models
-            if 'mi350x' in output or 'instinct mi350x' in output:
-                return 'MI350X'
-            elif 'mi355x' in output or 'instinct mi355x' in output:
-                return 'MI355X'
-            elif 'mi325x' in output or 'instinct mi325x' in output:
-                return 'MI325X'
-            elif 'mi300x' in output or 'instinct mi300x' in output:
-                return 'MI300X'
-            elif 'mi300a' in output or 'instinct mi300a' in output:
-                return 'MI300A'
-            elif 'mi250x' in output or 'instinct mi250x' in output:
-                return 'MI250X'
-            elif 'mi250' in output or 'instinct mi250' in output:
-                return 'MI250'
-        
-        # Try alternative method: check GPU device name from rocminfo
-        result = subprocess.run(['rocminfo'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False)
-        
-        if result.returncode == 0:
-            output = result.stdout.lower()
-            
-            # Look for marketing name or device name
-            for line in output.split('\n'):
-                if 'marketing name' in line or 'name:' in line:
-                    if 'mi350x' in line:
-                        return 'MI350X'
-                    if 'mi355x' in line:
-                        return 'MI355X'
-                    elif 'mi300x' in line:
-                        return 'MI300X'
-                    elif 'mi325x' in line:
-                        return 'MI325X'
-                    elif 'mi300a' in line:
-                        return 'MI300A'
-                    elif 'mi250x' in line:
-                        return 'MI250X'
-                    elif 'mi250' in line:
-                        return 'MI250'
-        
-        # Try checking gfx architecture ID
-        result = subprocess.run(['rocminfo'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False)
-        
-        if result.returncode == 0:
-            output = result.stdout.lower()
-            
-            # Match gfx architecture to GPU model
-            if 'gfx950' in output:
-                return 'MI355X'
-            elif 'gfx942' in output:
-                # gfx942 can be MI300A or MI300X or MI325X, need to check further
-                if 'mi300a' in output:
-                    return 'MI300A'
-                elif 'mi325x' in output:
-                    return 'MI325X'
-                else:
-                    return 'MI300X'
-            elif 'gfx90a' in output:
-                return 'MI250X'
-
-        # Try alternative method: check GPU device name from amd-smi
-        result = subprocess.run(['amd-smi'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, check=False)
-
-        if result.returncode == 0:
-            output = result.stdout.lower()
-
-            # Look for marketing name or device name
-            if 'mi350x' in output:
-                return 'MI350X'
-            elif 'mi355x' in output:
-                return 'MI355X'
-            elif 'mi300x' in output:
-                return 'MI300X'
-            elif 'mi325x' in output:
-                return 'MI325X'
-            elif 'mi300a' in output:
-                return 'MI300A'
-            elif 'mi250x' in output:
-                return 'MI250X'
-            elif 'mi250' in output:
-                return 'MI250'
-    
-    except FileNotFoundError:
-        print("Warning: rocm-smi, rocminfo, and amd-smi not found. Unable to detect GPU automatically. Use --arch to specify the architecture.")
-    except Exception as e:
-        print(f"Warning: Error detecting GPU: {e}. Use --arch to specify the architecture.")
-    
-    return None
-
-
 def main():
     parser = argparse.ArgumentParser(
         description='Run rocprofv3 with counter collection and kernel tracing',
@@ -296,7 +191,7 @@ def main():
     parser.add_argument(
         '--arch',
         required=False,
-        help='Supply architecture (to aid in guided analysis). Options: MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X. If not provided, will auto-detect.'
+        help='Supply architecture (to aid in guided analysis). Options: MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X.'
     )
     parser.add_argument(
         'run_command',
@@ -308,16 +203,19 @@ def main():
     output_dir = args.output_dir
     run_command = args.run_command
 
-    # Normalize --arch (same as rooflineExtractor.py)
-    if args.arch is not None:
-        args.arch = args.arch.replace('_', ' ').upper()
-
     # Validate --arch against same sources as rooflineExtractor.py
     script_dir = Path(__file__).parent
     _caches_path = script_dir / "config" / "cache_bandwidths.csv"
     _caches_df = pd.read_csv(_caches_path, index_col="Architecture")
     supported_arch = set(_caches_df.index)
-    if args.arch is not None and args.arch not in supported_arch:
+    if args.arch is None:
+        parser.error(
+            f"--arch is required. Supported: {', '.join(sorted(supported_arch))}"
+        )
+
+    # Normalize --arch (same as rooflineExtractor.py)
+    args.arch = args.arch.replace('_', ' ').upper()
+    if args.arch not in supported_arch:
         parser.error(
             f"Unsupported architecture '{args.arch}'. Supported: {', '.join(sorted(supported_arch))}"
         )
@@ -345,23 +243,14 @@ def main():
         'MI355X': 'gfx950'
     }
     
-    # Use user-provided arch if available, otherwise auto-detect
-    if args.arch:
-        detected_gpu = args.arch.upper()
-        gfx_arch = gpu_to_gfx.get(detected_gpu, 'gfx90a')
-        gpu_message = f"Using user-specified architecture: {detected_gpu} ({gfx_arch})"
-    else:
-        # Detect GPU (before creating logger, so store messages)
-        detected_gpu = detect_gpu()
-        
-        if detected_gpu:
-            gfx_arch = gpu_to_gfx.get(detected_gpu, 'gfx90a')
-            gpu_message = f"Detected GPU: {detected_gpu} ({gfx_arch})"
-        else:
-            parser.error(
-                "Could not detect GPU. Specify the architecture with --arch "
-                f"(e.g. --arch MI300X). Supported: {', '.join(sorted(supported_arch))}."
-            )
+    detected_gpu = args.arch.upper()
+    if detected_gpu not in gpu_to_gfx:
+        parser.error(
+            f"Architecture '{detected_gpu}' has no associated gfx target. "
+            f"Supported: {', '.join(sorted(gpu_to_gfx.keys()))}."
+        )
+    gfx_arch = gpu_to_gfx[detected_gpu]
+    gpu_message = f"Using user-specified architecture: {detected_gpu} ({gfx_arch})"
     
     # Save original working directory
     original_dir = os.getcwd()
@@ -370,7 +259,7 @@ def main():
     output_path = Path(__file__).parent / output_dir
     output_dir = os.path.abspath(output_path)
     
-    # Convert input counter file to absolute path (use detected architecture)
+    # Convert input counter file to absolute path (use selected architecture)
     roof_path = Path(__file__).parent / f'roof-counters-{gfx_arch}.txt'
     counter_input_file = os.path.abspath(roof_path)
     

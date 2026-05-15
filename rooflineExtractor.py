@@ -2330,20 +2330,32 @@ def extract(
         print('Error: "results.csv" log file submitted with "-c" flag, which is for "roof-counters.csv" log file')
         quit()
 
+    # Build a unique-dispatch identifier. In --directory mode each subdirectory's
+    # counters.csv numbers Dispatch_Id from 1, so the same Dispatch_Id value appears
+    # in multiple applications; we must qualify it with Application to count
+    # kernels correctly.
+    dispatch_id_col = "Dispatch_Id" if "Dispatch_Id" in df_roof.columns else "Index"
+    dispatch_id_cols = (
+        ["Application", dispatch_id_col]
+        if "Application" in df_roof.columns
+        else [dispatch_id_col]
+    )
+    total_kernels = df_roof[dispatch_id_cols].drop_duplicates().shape[0]
+
     # Check for 'None' values and remove them
-    total_omitted_kernels_round_1 = max(df_roof[(df_roof.isnull()).any(axis=1)]['Dispatch_Id'].unique().size, df_roof[(df_roof == 'None').any(axis=1)]['Dispatch_Id'].unique().size)
-    total_kernels = df_roof["Dispatch_Id"].unique().size
+    bad_row_mask = df_roof.isnull().any(axis=1) | (df_roof == 'None').any(axis=1)
+    total_omitted_kernels_round_1 = (
+        df_roof.loc[bad_row_mask, dispatch_id_cols].drop_duplicates().shape[0]
+    )
 
     if total_omitted_kernels_round_1 > 0:
         print(f'WARNING: {total_omitted_kernels_round_1}/{total_kernels} kernels can\'t be analyzed due to non-deterministic runs during counter collection. Attempting to continue without them.')
-        df_roof = df_roof[~(df_roof == 'None').any(axis=1)]
-        df_roof = df_roof[~(df_roof.isnull()).any(axis=1)]
+        # Materialize a fresh DataFrame so downstream column assignments (e.g.
+        # in convert_columns_to_int) don't trigger SettingWithCopyWarning.
+        df_roof = df_roof[~bad_row_mask].copy()
 
-    # If no arch specified, guess
-    if (arch == None) & (df_roof.keys().str.contains('TCC_BUBBLE').sum() > 0):
-        arch = 'MI300X'
-    elif arch == None:
-        arch = 'MI250X'
+    if arch is None:
+        raise ValueError("arch must be provided; pass --arch on the command line.")
 
     df_roof = convert_columns_to_int(df_roof)
     df_roof = compute_flops(df_roof, arch)  # Compute AI's for each kernel dispatch
@@ -2352,6 +2364,10 @@ def extract(
     if 'Agent_Id' in df_roof.columns:
         df_roof = df_roof.rename(columns={'Dispatch_Id':'Index'})
         df_roof = df_roof.rename(columns={'Kernel_Name':'KernelName'})
+        # Track the renamed dispatch id column for downstream unique-kernel counts.
+        dispatch_id_cols = [
+            'Index' if c == 'Dispatch_Id' else c for c in dispatch_id_cols
+        ]
 
     # Get runtime stats
     if isinstance(results, str):
@@ -2384,14 +2400,15 @@ def extract(
     negative_duration = (df_runtime['DurationNs'] < 0).sum()
     if negative_duration > 0:
         df_runtime = df_runtime[df_runtime['DurationNs'] >= 0]
-        print(f"WARNING: {negative_duration}/{total_kernels} kernels removed for having an end timestamp before the start timestamp. Attempting to continue without them.")
+        print(f"WARNING: {negative_duration}/{total_kernels} kernel-trace rows removed for having an end timestamp before the start timestamp. Attempting to continue without them.")
 
-    total_counter_kernels = df_roof.shape[0]
+    pre_merge_unique_kernels = df_roof[dispatch_id_cols].drop_duplicates().shape[0]
 
     # Merge runtimes into df_roof to get per-dispatch weight (Percentage of total runtime)
     df_roof = df_roof.merge(df_runtime[indexes + ['DurationNs']], on=indexes)
 
-    total_omitted_kernels_round_2 = total_counter_kernels - df_roof.shape[0]
+    post_merge_unique_kernels = df_roof[dispatch_id_cols].drop_duplicates().shape[0]
+    total_omitted_kernels_round_2 = pre_merge_unique_kernels - post_merge_unique_kernels
 
     if total_omitted_kernels_round_2 > 0:
         print(f"WARNING: {total_omitted_kernels_round_2}/{total_kernels} kernels can't be analyzed due to non-deterministic runs between counter collection and timing. Attempting to continue without them.")
@@ -2917,11 +2934,14 @@ def main():
     elif not args.counter or not args.results:
         parser.error("Provide --directory/-D, or both -c/--counter and -r/--results.")
 
-    if args.arch is not None:
-        args.arch = args.arch.replace('_', ' ').upper()
-
     supported_arch = set(caches.keys())
-    if args.arch is not None and args.arch not in supported_arch:
+    if args.arch is None:
+        parser.error(
+            f"--arch is required. Supported: {', '.join(sorted(supported_arch))}"
+        )
+    args.arch = args.arch.replace('_', ' ').upper()
+
+    if args.arch not in supported_arch:
         parser.error(
             f"Unsupported architecture '{args.arch}'. Supported: {', '.join(sorted(supported_arch))}"
         )
