@@ -160,6 +160,73 @@ def _format_byte_size(n):
     return f"{v:.3f} {units[u]}"
 
 
+def _compute_kernel_overlap_pct(df_runtime):
+    """Percentage of summed kernel runtime that overlapped, plus the wall-active time.
+
+    Returns ``(overlap_pct, wall_active_ns)`` where ``overlap_pct`` is
+    ``(sum_of_durations - wall_active_time) / sum_of_durations * 100`` and
+    ``wall_active_ns`` is the total wall-clock duration during which at least
+    one kernel was running (summed across traces/agents). A 0% overlap means
+    kernels ran fully sequentially; higher values indicate more concurrent
+    execution (e.g. across multiple HSA queues on the same GPU).
+
+    Timestamps are only comparable within a single trace/agent, so overlap is
+    computed per (Application, Agent_Id) group when those columns exist, then
+    aggregated. Returns ``(NaN, NaN)`` when the metric cannot be computed.
+    """
+    if df_runtime is None or len(df_runtime) == 0:
+        return float("nan"), float("nan")
+    if "Start_Timestamp" not in df_runtime.columns or "End_Timestamp" not in df_runtime.columns:
+        return float("nan"), float("nan")
+
+    group_cols = [c for c in ("Application", "Agent_Id") if c in df_runtime.columns]
+    groups = df_runtime.groupby(group_cols, sort=False) if group_cols else [(None, df_runtime)]
+
+    total_kernel_ns = 0
+    total_wall_ns = 0
+    for _, g in groups:
+        intervals = []
+        for start_raw, end_raw in zip(g["Start_Timestamp"], g["End_Timestamp"]):
+            try:
+                start = int(start_raw)
+                end = int(end_raw)
+            except (TypeError, ValueError):
+                continue
+            if end < start:
+                continue
+            intervals.append((start, end))
+
+        if not intervals:
+            continue
+
+        total_kernel_ns += sum(end - start for start, end in intervals)
+
+        # Sweep-line over interval endpoints to measure wall time during which
+        # at least one kernel is running. Process kernel ends (-1) before starts
+        # (+1) at equal timestamps so back-to-back kernels are treated as
+        # contiguous rather than overlapping.
+        events = []
+        for start, end in intervals:
+            events.append((start, 1))
+            events.append((end, -1))
+        events.sort(key=lambda event: (event[0], event[1]))
+
+        active = 0
+        last_t = events[0][0]
+        wall = 0
+        for t, d in events:
+            if active > 0:
+                wall += t - last_t
+            active += d
+            last_t = t
+        total_wall_ns += wall
+
+    if total_kernel_ns <= 0:
+        return float("nan"), float("nan")
+    overlap_pct = (total_kernel_ns - total_wall_ns) / total_kernel_ns * 100.0
+    return overlap_pct, total_wall_ns
+
+
 def _compute_ai_columns(df, mem_level):
     """Compute arithmetic intensity columns for one memory hierarchy level."""
     bw = df[f'BW_{mem_level}']
@@ -928,7 +995,66 @@ __D3_SCRIPT__
   .theme-dark .kernel-legend-list li.kernel-legend-selected {
     background: rgba(99, 110, 250, 0.25);
   }
-  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 12px 0; }
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0; }
+  .title-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 12px 0;
+    position: relative;
+  }
+  .info-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    margin-left: auto;
+    border-radius: 50%;
+    border: 1px solid var(--grid);
+    background: var(--paper-bg);
+    color: var(--fg);
+    font-size: 13px;
+    font-weight: 600;
+    font-style: italic;
+    font-family: Georgia, "Times New Roman", serif;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0;
+    opacity: 0.85;
+    transition: opacity 0.12s ease, background 0.12s ease;
+  }
+  .info-btn:hover, .info-btn[aria-expanded="true"] {
+    opacity: 1;
+    background: rgba(99, 110, 250, 0.18);
+    border-color: rgba(99, 110, 250, 0.7);
+  }
+  .info-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 60;
+    max-width: 460px;
+    background: var(--tooltip-bg);
+    color: var(--tooltip-fg);
+    border: 1px solid var(--tooltip-border);
+    border-radius: 6px;
+    padding: 10px 14px 12px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .info-popover[hidden] { display: none; }
+  .info-popover h3 {
+    margin: 0 0 6px 0;
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .info-popover ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .info-popover li { margin: 3px 0; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; margin-bottom: 12px; }
   .toolbar label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
   .toolbar select, .toolbar button { font-size: 0.9rem; padding: 4px 8px; }
@@ -958,7 +1084,22 @@ __D3_SCRIPT__
 </head>
 <body>
 <div id="roofline-app">
-  <h1 id="chart-title"></h1>
+  <div class="title-row">
+    <h1 id="chart-title"></h1>
+    <button type="button" id="btn-plot-info" class="info-btn" aria-label="How to read this plot" aria-expanded="false" aria-controls="plot-info-popover" title="How to read this plot">i</button>
+    <div id="plot-info-popover" class="info-popover" role="region" aria-labelledby="plot-info-heading" hidden>
+      <h3 id="plot-info-heading">Implementation Details and Disclaimers</h3>
+      <ul>
+        <li><b>Peak compute:</b> The peak compute is based on the instruction mix of each kernel. It is the weighted average of the measured throughput of each instruction counted in the kernel. Clicking on or hovering the mouse over a kernel dot will show that kernel's empirical peak compute. If none is selected, the default peak compute displayed is FP64 MFMA.</li>
+        <li><b>Total FLOPs:</b> The "flops" value reported includes floating point AND integer operations. These operations all go through the same VALU pipe, so they should be counted together. </li>
+        <li><b>Curved rooflines:</b> HBM and LDS rooflines are drawn with a curved shape. This is because workloads that are demanding in bandwidth AND compute consume more power, and subsequently get their clocks throttled. So, the roofline peak is lower in the "knee" region, where the bandwidth and compute lines meet. </li>
+        <li><b>Packed instructions:</b> Any packed instructions are counted as 1 operation by the profiler. If your workload uses packed instructions, the flops value may be underreported. </li>
+        <li><b>Other VALU operations:</b> Some VALU operations do not have dedicated hardware counters, such as bitwise operations. These operations are counted as "Other VALU" in roofline extractor output. The throughput value of `v_lshlrev_b32_e32` is used for this category.</li>
+        <li><b>Compute partitioning:</b> Roofline extractor assumes the application was run in SPX mode. </li>
+        <li><b>Overlapping kernels:</b> If the application has multiple kernels running concurrently, e.g. using HIP streams, multiple kernels may be contending for the same hardware resources and thus unable to achieve their roofline peaks. </li>
+      </ul>
+    </div>
+  </div>
   <div class="toolbar">
     <label>Memory region
       <select id="memory-region-select" aria-label="Memory hierarchy for arithmetic intensity"></select>
@@ -1598,6 +1739,32 @@ __D3_SCRIPT__
   document.getElementById("btn-theme-toggle").addEventListener("click", () => setTheme(!isDarkTheme()));
   syncThemeToggle();
 
+  (function setupPlotInfoPopover() {
+    const btn = document.getElementById("btn-plot-info");
+    const pop = document.getElementById("plot-info-popover");
+    if (!btn || !pop) return;
+    function setOpen(open) {
+      pop.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+    }
+    btn.addEventListener("click", function(ev) {
+      ev.stopPropagation();
+      setOpen(pop.hidden);
+    });
+    document.addEventListener("click", function(ev) {
+      if (pop.hidden) return;
+      if (ev.target === btn || btn.contains(ev.target)) return;
+      if (pop.contains(ev.target)) return;
+      setOpen(false);
+    });
+    document.addEventListener("keydown", function(ev) {
+      if (ev.key === "Escape" && !pop.hidden) {
+        setOpen(false);
+        btn.focus();
+      }
+    });
+  })();
+
   (function setupHbmLdsRooflineToggle() {
     const btn = document.getElementById("btn-hbm-lds-roofline-toggle");
     if (!btn) return;
@@ -2231,12 +2398,20 @@ def extract(
                 ]
                 inst_mix.sort(key=lambda x: x[1], reverse=True)
                 print("  Instruction mix:".ljust(33), "(roofline peak)")
+                other_valu_printed = False
                 for label, pct, peak in inst_mix:
                     if peak is None or not np.isfinite(peak) or peak <= 0:
                         peak_str = "N/A"
                     else:
                         peak_str = f"{peak / 1000:.1f} TFLOPs/s"
-                    print(f"    {label + ':':20s} {pct:5.1f}%   ({peak_str})")
+                    display_label = label
+                    if label == "Other VALU":
+                        display_label = label + "*"
+                        other_valu_printed = True
+                    print(f"    {display_label + ':':20s} {pct:5.1f}%   ({peak_str})")
+                if other_valu_printed:
+                    print("    * \"Other VALU\" refers to instructions not covered by the other categories.")
+                    print("      We use the peak throughput value of v_lshlrev_b32_e32 here.")
                 print()
 
         # Calculate achieved
@@ -2298,7 +2473,33 @@ def extract(
     print(f"\033[1m{insigKernels} kernels omitted from CLI output for having less than {sigRuntime} percent GPU time (use --sig-runtime to change threshold)\033[0m")
     print()
 
-    print(f"Total application GPU time on {arch}: {df_runtime['DurationNs'].sum():.2e} ns ({df_runtime['DurationNs'].sum()/1e9:.6f} s)")
+    _gpu_time_label = f"Total application GPU time on {arch}:"
+    _wall_active_label = "Total application wall-clock kernel-active time:"
+    _total_app_ns = df_runtime['DurationNs'].sum()
+    overlap_pct, wall_active_ns = _compute_kernel_overlap_pct(df_runtime)
+    _show_wall_active = (
+        np.isfinite(overlap_pct) and overlap_pct > 1 and np.isfinite(wall_active_ns)
+    )
+    if _show_wall_active:
+        _time_label_width = max(len(_gpu_time_label), len(_wall_active_label))
+        _gpu_time_label_out = _gpu_time_label.ljust(_time_label_width)
+        _wall_active_label_out = _wall_active_label.ljust(_time_label_width)
+    else:
+        _gpu_time_label_out = _gpu_time_label
+        _wall_active_label_out = _wall_active_label
+    print(
+        f"{_gpu_time_label_out} "
+        f"{_total_app_ns:.2e} ns ({_total_app_ns/1e9:.6f} s)"
+    )
+    if np.isfinite(overlap_pct) and overlap_pct > 1:
+        if _show_wall_active:
+            print(
+                f"{_wall_active_label_out} "
+                f"{wall_active_ns:.2e} ns ({wall_active_ns/1e9:.6f} s)"
+            )
+        print(
+            f"Kernel runtime overlap: {overlap_pct:.3f} % of total kernel runtime consists of overlapping, concurrent kernels"
+        )
     print()
 
     df_roof['Percentage'] = df_roof['DurationNs']/sum(totalRuntimes) * 100
@@ -2478,7 +2679,7 @@ def extract(
 
         payload = {
             "meta": {
-                "title": f"Roofline Plot for kernels in {roofCountFilename}",
+                "title": f"Roofline Plot ({arch}) for kernels in {roofCountFilename}",
                 "xMin": x_min,
                 "xMax": x_max,
                 "yMin": y_min,
