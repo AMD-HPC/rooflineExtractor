@@ -978,20 +978,6 @@ __D3_SCRIPT__
   .kernel-legend-list li.kernel-legend-dimmed {
     opacity: 0.4;
   }
-  .roofline-swatch {
-    flex-shrink: 0;
-    width: 22px;
-    height: 3px;
-    margin-top: 6px;
-    background: #636EFA;
-    border-radius: 1px;
-  }
-  .legend-divider {
-    border: 0;
-    border-top: 1px solid var(--grid);
-    margin: 12px 0;
-    flex-shrink: 0;
-  }
   .theme-dark .kernel-legend-list li.kernel-legend-selected {
     background: rgba(99, 110, 250, 0.25);
   }
@@ -1119,26 +1105,20 @@ __D3_SCRIPT__
         <button type="button" id="btn-theme-toggle" aria-pressed="true" title="Switch to light theme">Light mode</button>
         <button type="button" id="btn-hbm-lds-roofline-toggle" hidden aria-pressed="true" title="Use piecewise-linear roofs for HBM and LDS">Linear HBM/LDS</button>
         <button type="button" id="btn-reset-zoom" title="Reset axes to default range">Reset zoom</button>
+        <button type="button" id="btn-export-png" title="Download the current plot as a PNG image">Export PNG</button>
       </span>
     </label>
   </div>
   <p class="chart-hint">Scroll to zoom, drag to pan (double-click chart to reset).</p>
   <div class="chart-row">
     <div id="chart-wrap"></div>
-    <aside class="kernel-legend-panel" aria-label="Kernel and bandwidth roofline legends">
+    <aside class="kernel-legend-panel" aria-label="Kernel legends">
       <div class="kernel-legend-header">
         <h2 class="kernel-legend-heading" id="kernel-legend-heading">Kernels</h2>
         <button type="button" class="kernel-legend-clear" id="kernel-legend-clear" hidden>Show all kernels</button>
       </div>
       <p class="kernel-legend-help" id="kernel-legend-help">Click a row to show only that kernel; click again to show all. Ctrl+click (⌘+click on Mac) to add or remove kernels.</p>
       <ul class="kernel-legend-list" id="kernel-legend-list" role="list"></ul>
-      <hr class="legend-divider" />
-      <div class="kernel-legend-header">
-        <h2 class="kernel-legend-heading" id="roofline-legend-heading">Bandwidth rooflines</h2>
-        <button type="button" class="kernel-legend-clear" id="roofline-legend-clear" hidden>Show all rooflines</button>
-      </div>
-      <p class="kernel-legend-help" id="roofline-legend-help">Click a row to show only that roofline; click again to show all. Ctrl+click (⌘+click on Mac) to add or remove rooflines.</p>
-      <ul class="kernel-legend-list" id="roofline-legend-list" role="list"></ul>
     </aside>
   </div>
   <div id="disclaimer"></div>
@@ -1299,9 +1279,6 @@ __D3_SCRIPT__
   const kUl = document.getElementById("kernel-legend-list");
   const kHead = document.getElementById("kernel-legend-heading");
   const kClear = document.getElementById("kernel-legend-clear");
-  const rUl = document.getElementById("roofline-legend-list");
-  const rHead = document.getElementById("roofline-legend-heading");
-  const rClear = document.getElementById("roofline-legend-clear");
   const selectedKernelNames = new Set();
   const selectedRooflineKeys = new Set();
   let roofHoverKernelName = null;
@@ -1541,27 +1518,6 @@ __D3_SCRIPT__
     }
   }
 
-  function updateRooflineLegendUI() {
-    if (rHead) {
-      let t = "Bandwidth rooflines (" + cacheKeys.length + ")";
-      if (rooflineFilterActive()) {
-        t += " — " + selectedRooflineKeys.size + " selected";
-      }
-      rHead.textContent = t;
-    }
-    if (rClear) rClear.hidden = !rooflineFilterActive();
-    if (rUl) {
-      rUl.querySelectorAll("li").forEach(function(li) {
-        const key = li._rooflineKey;
-        if (!key) return;
-        const on = selectedRooflineKeys.has(key);
-        const active = rooflineFilterActive();
-        li.classList.toggle("kernel-legend-selected", on);
-        li.classList.toggle("kernel-legend-dimmed", active && !on);
-      });
-    }
-  }
-
   function onKernelLegendActivate(event, name) {
     if (event.ctrlKey || event.metaKey) {
       if (!kernelFilterActive()) {
@@ -1602,7 +1558,6 @@ __D3_SCRIPT__
         selectedRooflineKeys.add(key);
       }
     }
-    updateRooflineLegendUI();
     redraw();
   }
 
@@ -1642,44 +1597,6 @@ __D3_SCRIPT__
     kClear.addEventListener("click", function() {
       selectedKernelNames.clear();
       updateKernelLegendUI();
-      redraw();
-    });
-  }
-
-  if (rUl) {
-    cacheKeys.forEach(function(key) {
-      const li = document.createElement("li");
-      li._rooflineKey = key;
-      li.setAttribute("role", "listitem");
-      li.tabIndex = 0;
-      const sw = document.createElement("span");
-      sw.className = "roofline-swatch";
-      sw.style.backgroundColor = rooflineColorForKey(key);
-      sw.setAttribute("aria-hidden", "true");
-      const lab = document.createElement("span");
-      lab.className = "kernel-name";
-      lab.textContent = key;
-      lab.title = key;
-      li.appendChild(sw);
-      li.appendChild(lab);
-      li.addEventListener("click", function(ev) {
-        onRooflineLegendActivate(ev, key);
-      });
-      li.addEventListener("keydown", function(ev) {
-        if (ev.key === "Enter" || ev.key === " ") {
-          ev.preventDefault();
-          onRooflineLegendActivate(ev, key);
-        }
-      });
-      rUl.appendChild(li);
-    });
-  }
-  updateRooflineLegendUI();
-
-  if (rClear) {
-    rClear.addEventListener("click", function() {
-      selectedRooflineKeys.clear();
-      updateRooflineLegendUI();
       redraw();
     });
   }
@@ -2098,6 +2015,223 @@ __D3_SCRIPT__
     event.preventDefault();
     resetZoom();
   });
+
+  function sanitizeFilename(name) {
+    return (name || "roofline").replace(/[^A-Za-z0-9._-]+/g, "_").replace(/^_+|_+$/g, "") || "roofline";
+  }
+  function exportPng() {
+    const btn = document.getElementById("btn-export-png");
+    const svgNode = document.querySelector("#chart-wrap svg");
+    if (!svgNode) return;
+    const prevLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Exporting...";
+    // Resolve themed CSS variables to concrete colors so the rasterized SVG
+    // (which is rendered detached from the document) still picks up the right theme.
+    const cs = getComputedStyle(document.documentElement);
+    const cssVar = (name, fallback) => (cs.getPropertyValue(name) || "").trim() || fallback;
+    const plotBg = cssVar("--plot-bg", "#ffffff");
+    const fg = cssVar("--fg", "#111111");
+    const axisColor = cssVar("--axis", "#000000");
+    const gridColor = cssVar("--grid", "#d3d3d3");
+
+    const clone = svgNode.cloneNode(true);
+    clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
+    clone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
+    const widthAttr = parseFloat(svgNode.getAttribute("width")) || svgNode.clientWidth || W;
+    const heightAttr = parseFloat(svgNode.getAttribute("height")) || svgNode.clientHeight || H;
+    clone.setAttribute("width", widthAttr);
+    clone.setAttribute("height", heightAttr);
+    if (!clone.getAttribute("viewBox")) {
+      clone.setAttribute("viewBox", "0 0 " + widthAttr + " " + heightAttr);
+    }
+
+    // Inline the SVG-relevant rules from the document <head>. The cloned SVG
+    // is rasterized detached from the page, so these rules (and the CSS
+    // custom properties they depend on) would otherwise be lost — most
+    // visibly turning every <path class="roofline-path"> into a black-filled
+    // region under the curve.
+    const styleEl = document.createElementNS("http://www.w3.org/2000/svg", "style");
+    styleEl.textContent = [
+      "text { font-family: system-ui, sans-serif; fill: " + fg + "; }",
+      ".roofline-path { fill: none; stroke-linejoin: round; }",
+      ".roofline-hit { fill: none; stroke: transparent; }",
+      ".dot { stroke: rgba(0,0,0,0.25); stroke-width: 0.5; }",
+      ".axis text { fill: " + fg + "; font-size: 11px; }",
+      ".axis line, .axis path { fill: none; stroke: " + axisColor + "; }",
+      ".grid line { stroke: " + gridColor + "; stroke-opacity: 0.9; }",
+      ".axis-title { fill: " + fg + "; font-weight: 600; font-size: 13px; }",
+      ".legend-box { font-size: 11px; }",
+      ".legend-bg { fill: " + plotBg + "; stroke: " + gridColor + "; stroke-width: 1; opacity: 0.94; }",
+      ".legend-title { font-weight: 600; font-size: 11px; fill: " + fg + "; }",
+      ".legend-row-label { fill: " + fg + "; font-size: 11px; }",
+    ].join(" ");
+    clone.insertBefore(styleEl, clone.firstChild);
+
+    // Render an SVG-native version of the on-screen kernel legend to the right of the chart.
+    // The on-screen kernel legend is an HTML <aside>, which would be lost when serializing only the SVG.
+    // Bandwidth roofline legend is already part of the SVG and is preserved by the clone.
+    // This mirrors the current threshold filter, selection state, swatch colors, and per-kernel percentages.
+    const SVG_NS = "http://www.w3.org/2000/svg";
+    function truncateLabel(s, maxChars) {
+      if (typeof s !== "string") return "";
+      return s.length > maxChars ? s.slice(0, Math.max(1, maxChars - 1)) + "\u2026" : s;
+    }
+    function buildExportLegendPanel(panelX, chartHeight) {
+      const visibleKernels = computeKernelsVisibleAtThreshold();
+      const kernelRows = kLeg.filter(k => visibleKernels.has(k.name));
+      const pad = 12;
+      const panelW = 360;
+      const headLine = 22;
+      const rowH = 16;
+      const swatchSize = 12;
+      const labelX = pad + swatchSize + 8;
+      const labelMaxChars = 36;
+      const baseline = swatchSize - 1;
+      const kFilterActive = kernelFilterActive();
+
+      const panel = document.createElementNS(SVG_NS, "g");
+      panel.setAttribute("transform", "translate(" + panelX + ",0)");
+      const bg = document.createElementNS(SVG_NS, "rect");
+      bg.setAttribute("x", "0");
+      bg.setAttribute("y", "0");
+      bg.setAttribute("width", String(panelW));
+      bg.setAttribute("fill", plotBg);
+      bg.setAttribute("stroke", gridColor);
+      panel.appendChild(bg);
+
+      let y = pad;
+
+      const kHeadEl = document.createElementNS(SVG_NS, "text");
+      kHeadEl.setAttribute("x", String(pad));
+      kHeadEl.setAttribute("y", String(y + 14));
+      kHeadEl.setAttribute("font-size", "13");
+      kHeadEl.setAttribute("font-weight", "600");
+      kHeadEl.setAttribute("fill", fg);
+      let kHeadText = kernelRows.length < kLeg.length
+        ? "Kernels (" + kernelRows.length + " / " + kLeg.length + ")"
+        : "Kernels (" + kLeg.length + ")";
+      if (kFilterActive) {
+        kHeadText += " \u2014 " + selectedKernelNames.size + " selected";
+      }
+      kHeadEl.textContent = kHeadText;
+      panel.appendChild(kHeadEl);
+      y += headLine;
+
+      kernelRows.forEach(function(k) {
+        const dimmed = kFilterActive && !selectedKernelNames.has(k.name);
+        const opacity = dimmed ? "0.45" : "1";
+        const sw = document.createElementNS(SVG_NS, "rect");
+        sw.setAttribute("x", String(pad));
+        sw.setAttribute("y", String(y));
+        sw.setAttribute("width", String(swatchSize));
+        sw.setAttribute("height", String(swatchSize));
+        sw.setAttribute("fill", k.color || "#888");
+        sw.setAttribute("opacity", opacity);
+        panel.appendChild(sw);
+
+        const lab = document.createElementNS(SVG_NS, "text");
+        lab.setAttribute("x", String(labelX));
+        lab.setAttribute("y", String(y + baseline));
+        lab.setAttribute("font-size", "11");
+        lab.setAttribute("fill", fg);
+        lab.setAttribute("opacity", opacity);
+        lab.textContent = truncateLabel(k.name, labelMaxChars);
+        panel.appendChild(lab);
+
+        if (k.pct != null && Number.isFinite(k.pct)) {
+          const pctEl = document.createElementNS(SVG_NS, "text");
+          pctEl.setAttribute("x", String(panelW - pad));
+          pctEl.setAttribute("y", String(y + baseline));
+          pctEl.setAttribute("font-size", "11");
+          pctEl.setAttribute("text-anchor", "end");
+          pctEl.setAttribute("fill", fg);
+          pctEl.setAttribute("opacity", opacity);
+          pctEl.textContent = k.pct.toFixed(2) + "%";
+          panel.appendChild(pctEl);
+        }
+        y += rowH;
+      });
+
+      const naturalH = y + pad;
+      const finalH = Math.max(chartHeight, naturalH);
+      bg.setAttribute("height", String(finalH));
+      return { panel: panel, width: panelW, height: finalH };
+    }
+
+    const legendGap = 12;
+    const legend = buildExportLegendPanel(widthAttr + legendGap, heightAttr);
+    clone.appendChild(legend.panel);
+    const exportW = widthAttr + legendGap + legend.width;
+    const exportH = Math.max(heightAttr, legend.height);
+    clone.setAttribute("width", String(exportW));
+    clone.setAttribute("height", String(exportH));
+    clone.setAttribute("viewBox", "0 0 " + exportW + " " + exportH);
+
+    const serializer = new XMLSerializer();
+    const svgString = '<?xml version="1.0" standalone="no"?>\\n' + serializer.serializeToString(clone);
+    const svgBlob = new Blob([svgString], { type: "image/svg+xml;charset=utf-8" });
+    const svgUrl = URL.createObjectURL(svgBlob);
+
+    const scale = Math.max(1, Math.min(4, window.devicePixelRatio || 2));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(exportW * scale);
+    canvas.height = Math.round(exportH * scale);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      console.error("PNG export failed: could not acquire 2D canvas context.");
+      URL.revokeObjectURL(svgUrl);
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+      return;
+    }
+    ctx.fillStyle = plotBg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(scale, 0, 0, scale, 0, 0);
+
+    const img = new Image();
+    function cleanup() {
+      URL.revokeObjectURL(svgUrl);
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+    }
+    img.onload = function() {
+      try {
+        ctx.drawImage(img, 0, 0, exportW, exportH);
+      } catch (e) {
+        console.error("PNG export draw failed:", e);
+        cleanup();
+        return;
+      }
+      const fileName = sanitizeFilename(meta && meta.title) + ".png";
+      const triggerDownload = (href) => {
+        const a = document.createElement("a");
+        a.href = href;
+        a.download = fileName;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+      };
+      const finish = () => cleanup();
+      if (canvas.toBlob) {
+        canvas.toBlob(function(blob) {
+          if (!blob) { finish(); return; }
+          const url = URL.createObjectURL(blob);
+          triggerDownload(url);
+          setTimeout(() => { URL.revokeObjectURL(url); finish(); }, 0);
+        }, "image/png");
+      } else {
+        triggerDownload(canvas.toDataURL("image/png"));
+        finish();
+      }
+    };
+    img.onerror = function(err) {
+      console.error("PNG export load failed:", err);
+      cleanup();
+    };
+    img.src = svgUrl;
+  }
+  document.getElementById("btn-export-png").addEventListener("click", exportPng);
 
   function onViewControlsChange() {
     redraw();
