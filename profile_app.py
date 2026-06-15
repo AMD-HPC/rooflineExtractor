@@ -296,7 +296,11 @@ def main():
     logger.write("=" * 80)
     
     # Run rocprofv3 with counter collection
-    logger.write("\n[1/4] Running rocprofv3 with counter collection (four runs of the application)...")
+    # Update message based on the selected counter input file
+    plural = "runs"
+    with open(counter_input_file, 'r', encoding='utf-8') as counter_file:
+        n_runs = sum(1 for line in counter_file if line.strip().startswith('pmc:'))
+    logger.write(f"\n[1/4] Running rocprofv3 with counter collection ({n_runs} {plural} of the application)...")
     logger.write(f"Command: rocprofv3 -i {counter_input_file} -o counters -f csv -- {run_command_str}")
     logger.write("-" * 80)
     
@@ -465,5 +469,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 

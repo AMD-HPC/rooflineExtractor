@@ -30,15 +30,11 @@ caches = _caches_df.to_dict(orient="index")
 
 # Function to convert columns with type mismatches to integers
 def convert_columns_to_int(df):
-    counters = ['SQ_INSTS_VALU_ADD_F16', 'SQ_INSTS_VALU_MUL_F16',       'SQ_INSTS_VALU_FMA_F16', 'SQ_INSTS_VALU_TRANS_F16',       'SQ_INSTS_VALU_ADD_F32', 'SQ_INSTS_VALU_MUL_F32',       'SQ_INSTS_VALU_FMA_F32', 'SQ_INSTS_VALU_TRANS_F32',       'SQ_INSTS_VALU_ADD_F64', 'SQ_INSTS_VALU_MUL_F64',       'SQ_INSTS_VALU_FMA_F64', 'SQ_INSTS_VALU_TRANS_F64',       'SQ_INSTS_VALU_MFMA_MOPS_F16', 'SQ_INSTS_VALU_MFMA_MOPS_BF16',       'SQ_INSTS_VALU_MFMA_MOPS_F32', 'SQ_INSTS_VALU_MFMA_MOPS_F64', 'SQ_LDS_IDX_ACTIVE', 'SQ_LDS_BANK_CONFLICT',       'TCP_TCC_READ_REQ_sum', 'TCP_TCC_WRITE_REQ_sum',       'TCP_TCC_ATOMIC_WITH_RET_REQ_sum', 'TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum',       'TCP_TOTAL_CACHE_ACCESSES_sum', 'SQ_INSTS_VALU_INT32',       'SQ_INSTS_VALU_INT64', 'SQ_INSTS_VALU_CVT', 'SQ_INSTS_SALU']
+    counters = ['SQ_INSTS_VALU_ADD_F16', 'SQ_INSTS_VALU_MUL_F16',       'SQ_INSTS_VALU_FMA_F16', 'SQ_INSTS_VALU_TRANS_F16',       'SQ_INSTS_VALU_ADD_F32', 'SQ_INSTS_VALU_MUL_F32',       'SQ_INSTS_VALU_FMA_F32', 'SQ_INSTS_VALU_TRANS_F32',       'SQ_INSTS_VALU_ADD_F64', 'SQ_INSTS_VALU_MUL_F64',       'SQ_INSTS_VALU_FMA_F64', 'SQ_INSTS_VALU_TRANS_F64',       'SQ_INSTS_VALU_MFMA_MOPS_F16', 'SQ_INSTS_VALU_MFMA_MOPS_BF16',       'SQ_INSTS_VALU_MFMA_MOPS_F32', 'SQ_INSTS_VALU_MFMA_MOPS_F64', 'SQ_LDS_IDX_ACTIVE', 'SQ_LDS_BANK_CONFLICT',       'TCP_TCC_READ_REQ_sum', 'TCP_TCC_WRITE_REQ_sum',       'TCP_TCC_ATOMIC_WITH_RET_REQ_sum', 'TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum',       'TCP_TOTAL_CACHE_ACCESSES_sum', 'SQ_INSTS_VALU_INT32',       'SQ_INSTS_VALU_INT64',  'SQ_INSTS_SALU']
 
     # Checks for counters that were added in later versions of rooflineExtractor (to stay compatible with earlier counter files)
     if 'TCC_REQ_sum' in df.columns:
         counters.append('TCC_REQ_sum')
-    if 'SQ_INSTS_VMEM_WR' in df.columns:
-        counters.append('SQ_INSTS_VMEM_WR')
-    if 'SQ_INSTS_VMEM_RD' in df.columns:
-        counters.append('SQ_INSTS_VMEM_RD')
     if 'SQ_INSTS_VALU' in df.columns:
         counters.append('SQ_INSTS_VALU')
     if 'SQ_INSTS_VALU_MFMA_MOPS_I8' in df.columns:
@@ -724,11 +720,7 @@ def compute_flops(df, arch):
         new_columns['BW_L2'] = 64 * df['TCP_TCC_READ_REQ_sum'] + 64 * df['TCP_TCC_WRITE_REQ_sum'] + new_columns['BW_LDS_ATOMICS']
 
     ## vL1D
-    if 'SQ_INSTS_VMEM_WR' in df.columns:
-        new_columns['BW_vL1d'] = 256 * (df['SQ_INSTS_VMEM_WR'] + df['SQ_INSTS_VMEM_RD'])
-    else:
-        # Less reliable calculation kept to be backwards compatible with earlier rooflineExtractor versions
-        new_columns['BW_vL1d'] = 128 * df['TCP_TOTAL_CACHE_ACCESSES_sum']
+    new_columns['BW_vL1d'] = 64 * df['TCP_TOTAL_CACHE_ACCESSES_sum']
 
     ## HBM
     ### Check architecture

@@ -16,9 +16,9 @@ python3 profile_app.py --arch <ARCH> -- <app exe> [args...]
 
 This script will:
 1. Use the GPU architecture you pass via `--arch` (one of MI250, MI250X, MI300A, MI300X, MI325X, MI350X, MI355X) to pick the matching counter input file
-2. Run `rocprofv3` to collect hardware counters (four runs of the application)
+2. Run `rocprofv3` to collect hardware counters (3-4 runs of the application)
 3. Perform post-processing on the counter data
-4. Run `rocprofv3` to collect kernel trace data (one run of the application)
+4. Run `rocprofv3` to collect kernel trace data (1 run of the application)
 5. Run `rooflineExtractor.py` to generate analysis and plots
 
 **Note:** The script uses the `-f csv` flag with rocprofv3, which is only available in ROCm 7 and later. If the flag is not recognized, the script will automatically retry without it.
