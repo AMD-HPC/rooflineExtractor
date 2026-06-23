@@ -22,6 +22,30 @@ _QUAL_COLORS = [
 
 sigRuntime = 10  # Default value, can be changed from command line
 
+# MFMA *instruction* counters (count the number of MFMA instructions issued, which
+# is distinct from the SQ_INSTS_VALU_MFMA_MOPS_* counters that count total
+# math operations. MFMA instructions are included in SQ_INSTS_VALU, so they are
+# subtracted from the SQ_INSTS_VALU leftover to avoid being attributed to the
+# "Other VALU" bucket. Collected on all platforms; guarded by column-existence
+# checks to stay compatible with counter files captured by earlier versions.
+MFMA_INST_COUNTERS = [
+    'SQ_INSTS_VALU_MFMA_I8',
+    'SQ_INSTS_VALU_MFMA_F6F4',
+    'SQ_INSTS_VALU_MFMA_F8',
+    'SQ_INSTS_VALU_MFMA_BF16',
+    'SQ_INSTS_VALU_MFMA_F16',
+    'SQ_INSTS_VALU_MFMA_F32',
+    'SQ_INSTS_VALU_MFMA_F64',
+]
+
+
+def _mfma_inst_sum(df):
+    """Sum of all MFMA instruction counters present in df (0 if none present)."""
+    cols = [c for c in MFMA_INST_COUNTERS if c in df.columns]
+    if not cols:
+        return 0
+    return df[cols].sum(axis=1)
+
 # Bandwidths — loaded from config/cache_bandwidths.csv relative to this script's location
 _caches_path = _config_dir / "cache_bandwidths.csv"
 _caches_df = pd.read_csv(_caches_path, index_col="Architecture")
@@ -43,6 +67,9 @@ def convert_columns_to_int(df):
         counters.append('SQ_INSTS_VALU_MFMA_MOPS_F8')
     if 'SQ_INSTS_VALU_MFMA_MOPS_F6F4' in df.columns:
         counters.append('SQ_INSTS_VALU_MFMA_MOPS_F6F4')
+    for mfma_inst in MFMA_INST_COUNTERS:
+        if mfma_inst in df.columns:
+            counters.append(mfma_inst)
     # Check for CDNA2 vs. CDNA3-4 counters
     if 'TCC_BUBBLE_sum' in df.columns:
         counters.append('TCC_BUBBLE_sum')
@@ -606,8 +633,9 @@ def _align_curved_limiter_with_linear_compute(limiter, limiter_linear):
 def compute_flops(df, arch):
     # Drop dispatches whose VALU counters are inconsistent across PMC passes.
     # SQ_INSTS_VALU is captured in a different PMC counter-collection run than the typed
-    # counters (SQ_INSTS_VALU_ADD_*, _MUL_*, _FMA_*, _TRANS_*, _INT32, _INT64). The
-    # leftover 64 * (SQ_INSTS_VALU - typed_sum) represents bitwise ops not
+    # counters (SQ_INSTS_VALU_ADD_*, _MUL_*, _FMA_*, _TRANS_*, _INT32, _INT64, plus
+    # MFMA instruction counters). The leftover 64 * (SQ_INSTS_VALU - typed_sum)
+    # represents bitwise ops not
     # captured by the typed counters and must be >= 0. A negative leftover means one of
     # the PMC counter-collection files is corrupted/inconsistent for that dispatch
     # (typically the SQ_INSTS_VALU pass came back as 0). Drop those dispatches with a
@@ -617,7 +645,7 @@ def compute_flops(df, arch):
             df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + df['SQ_INSTS_VALU_FMA_F16']
             + df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + df['SQ_INSTS_VALU_FMA_F32']
             + df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + df['SQ_INSTS_VALU_FMA_F64']
-            + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64']
+            + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64'] + _mfma_inst_sum(df)
         )
         _valu_other_raw = 64 * (df['SQ_INSTS_VALU'] - _valu_typed_sum)
         _corrupt_mask = _valu_other_raw < 0
@@ -686,7 +714,7 @@ def compute_flops(df, arch):
                 df['SQ_INSTS_VALU_ADD_F16'] + df['SQ_INSTS_VALU_MUL_F16'] + df['SQ_INSTS_VALU_TRANS_F16'] + df['SQ_INSTS_VALU_FMA_F16']
                 + df['SQ_INSTS_VALU_ADD_F32'] + df['SQ_INSTS_VALU_MUL_F32'] + df['SQ_INSTS_VALU_TRANS_F32'] + df['SQ_INSTS_VALU_FMA_F32']
                 + df['SQ_INSTS_VALU_ADD_F64'] + df['SQ_INSTS_VALU_MUL_F64'] + df['SQ_INSTS_VALU_TRANS_F64'] + df['SQ_INSTS_VALU_FMA_F64']
-                + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64']
+                + df['SQ_INSTS_VALU_INT32'] + df['SQ_INSTS_VALU_INT64'] + _mfma_inst_sum(df)
             )
         )
 
