@@ -1215,6 +1215,14 @@ __D3_SCRIPT__
   const data = JSON.parse(document.getElementById("roofline-json").textContent);
   const meta = data.meta;
   const cacheKeys = data.cacheKeys;
+  // Memory regions ordered from closest to compute to furthest away. When a single
+  // kernel is plotted against all regions, dots are drawn in this order so that
+  // further-away regions (e.g. HBM) are painted on top of closer ones when they overlap.
+  const MEM_DISTANCE_ORDER = ["LDS", "vL1d", "L2", "HBM"];
+  function memDistanceRank(key) {
+    const i = MEM_DISTANCE_ORDER.indexOf(key);
+    return i < 0 ? -1 : i;
+  }
   const rooflinePalette = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3"];
   function rooflineColorForIndex(i) { return rooflinePalette[i % rooflinePalette.length]; }
   function rooflineColorForKey(key) {
@@ -1975,13 +1983,18 @@ __D3_SCRIPT__
     const agg = currentMode().aggregate;
     const src = agg ? data.aggregate : data.dispatch;
     const expanded = [];
+    // Closest-to-furthest order so further-away regions are appended last and
+    // therefore drawn on top of closer ones when their dots overlap.
+    const orderedMemKeys = cacheKeys.slice().sort(function(a, b) {
+      return memDistanceRank(a) - memDistanceRank(b);
+    });
     src.forEach(function(d) {
       const c = d.cumulativePct;
       if (c == null || !Number.isFinite(c) || c > t) return;
       if (!selectedKernelNames.has(d.kernelName)) return;
       const tp = d.throughput;
       if (tp == null || !(tp > 0) || !Number.isFinite(tp)) return;
-      cacheKeys.forEach(function(memKey) {
+      orderedMemKeys.forEach(function(memKey) {
         const a = d.ai[memKey];
         if (a == null || !(a > 0) || !Number.isFinite(a)) return;
         expanded.push(Object.assign({}, d, {
@@ -2034,7 +2047,10 @@ __D3_SCRIPT__
         roofHoverDispatchComputePeak = null;
         refreshRooflinesForDotHover();
         tooltip.style("display", "none");
-      });
+      })
+      // Reorder DOM nodes to match data order (closest first) so that, on updates,
+      // further-away memory regions stay painted on top of closer overlapping dots.
+      .order();
     sel.exit().remove();
   }
 
