@@ -140,6 +140,14 @@ def _safe_divide(numerator, denominator):
     return numerator.divide(denominator).replace(np.inf, 0).replace(np.nan, 0)
 
 
+def _format_ai(ops, bw):
+    """Format arithmetic intensity; return 'N/A' when bandwidth is 0 (divide by zero)."""
+    denom = float(pd.to_numeric(bw, errors="coerce"))
+    if not np.isfinite(denom) or denom == 0:
+        return "N/A"
+    return round(float(ops) / denom, 4)
+
+
 def _format_throughput(gflops):
     """Format a throughput in GFLOPs/s; switch to TFLOPs/s when >= 1 TFLOPs/s."""
     x = float(pd.to_numeric(gflops, errors="coerce"))
@@ -1223,7 +1231,8 @@ __D3_SCRIPT__
     const i = MEM_DISTANCE_ORDER.indexOf(key);
     return i < 0 ? -1 : i;
   }
-  const rooflinePalette = ["#636EFA", "#EF553B", "#00CC96", "#AB63FA", "#FFA15A", "#19D3F3"];
+  // Distinct from the kernel point palette (_QUAL_COLORS) so rooflines don't blend with dots.
+  const rooflinePalette = ["#005f73", "#9b2226", "#ee9b00", "#6a4c93", "#606c38", "#9c6644"];
   function rooflineColorForIndex(i) { return rooflinePalette[i % rooflinePalette.length]; }
   function rooflineColorForKey(key) {
     const idx = cacheKeys.indexOf(key);
@@ -1610,8 +1619,32 @@ __D3_SCRIPT__
     return visible;
   }
 
+  // Region roofline colors that the currently selected kernel's dots actually use,
+  // ordered by cacheKeys. Used to render a matching multi-color legend swatch.
+  function selectedKernelRegionColors() {
+    const seen = [];
+    computeDotData().forEach(function(d) {
+      if (d.memRegion && seen.indexOf(d.memRegion) < 0) seen.push(d.memRegion);
+    });
+    return cacheKeys.filter(function(k) { return seen.indexOf(k) >= 0; }).map(rooflineColorForKey);
+  }
+
+  // Build a hard-stop linear-gradient so each region color shows as a distinct band.
+  function rooflineSwatchGradient(cols) {
+    const n = cols.length;
+    const stops = cols.map(function(c, i) {
+      const a = (i / n * 100).toFixed(2);
+      const b = ((i + 1) / n * 100).toFixed(2);
+      return c + " " + a + "%, " + c + " " + b + "%";
+    });
+    return "linear-gradient(90deg, " + stops.join(", ") + ")";
+  }
+
   function updateKernelLegendUI() {
+    syncMemRegionControl();
     const visibleKernels = computeKernelsVisibleAtThreshold();
+    const singleKernelSelected = kernelFilterActive() && selectedKernelNames.size === 1;
+    const regionColors = singleKernelSelected ? selectedKernelRegionColors() : [];
     const totalCount = kLeg.length;
     const shownCount = visibleKernels.size;
     if (kHead) {
@@ -1634,6 +1667,16 @@ __D3_SCRIPT__
         const active = kernelFilterActive();
         li.classList.toggle("kernel-legend-selected", on);
         li.classList.toggle("kernel-legend-dimmed", active && !on);
+        const sw = li.querySelector(".kernel-swatch");
+        if (sw) {
+          if (singleKernelSelected && on && regionColors.length > 0) {
+            sw.style.backgroundColor = "";
+            sw.style.backgroundImage = rooflineSwatchGradient(regionColors);
+          } else {
+            sw.style.backgroundImage = "";
+            sw.style.backgroundColor = li._kernelColor;
+          }
+        }
       });
     }
   }
@@ -1690,6 +1733,7 @@ __D3_SCRIPT__
     sw.className = "kernel-swatch";
     sw.style.backgroundColor = k.color;
     sw.setAttribute("aria-hidden", "true");
+    li._kernelColor = k.color;
     const lab = document.createElement("span");
     lab.className = "kernel-name";
     lab.textContent = k.name;
@@ -1736,11 +1780,48 @@ __D3_SCRIPT__
   });
   memSel.value = "0";
 
+  // When a single kernel is selected its dots span every memory region, so the
+  // dropdown is switched to a disabled "All regions" state. lastRegionIndex
+  // remembers the user's chosen AI-axis region to restore afterward, and is also
+  // used as the effective region for internal calculations while "all" is shown.
+  let lastRegionIndex = 0;
+  let allRegionsOptionEl = null;
+
   const viewSel = document.getElementById("view-type-select");
   viewSel.value = "aggregate";
 
+  function effectiveRegionIndex() {
+    if (memSel.value === "all") return lastRegionIndex;
+    const n = +memSel.value;
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function syncMemRegionControl() {
+    const single = kernelFilterActive() && selectedKernelNames.size === 1;
+    if (single) {
+      if (memSel.value !== "all") lastRegionIndex = +memSel.value;
+      if (!allRegionsOptionEl) {
+        allRegionsOptionEl = document.createElement("option");
+        allRegionsOptionEl.value = "all";
+        allRegionsOptionEl.textContent = "All regions";
+        memSel.appendChild(allRegionsOptionEl);
+      }
+      memSel.value = "all";
+      memSel.disabled = true;
+      memSel.title = "All memory regions are shown for the selected kernel";
+    } else {
+      if (allRegionsOptionEl) {
+        if (memSel.value === "all") memSel.value = String(lastRegionIndex);
+        allRegionsOptionEl.remove();
+        allRegionsOptionEl = null;
+      }
+      memSel.disabled = false;
+      memSel.title = "";
+    }
+  }
+
   function currentMode() {
-    const r = +memSel.value;
+    const r = effectiveRegionIndex();
     const agg = viewSel.value === "aggregate";
     return {
       region: r,
@@ -1850,11 +1931,14 @@ __D3_SCRIPT__
   function updateRooflineWidths() {
     const r = currentMode().region;
     const filterOn = rooflineFilterActive();
+    // When a single kernel is selected its dots are drawn against every memory
+    // region, so thicken all rooflines (not just the AI-axis one) to match.
+    const singleKernelSelected = kernelFilterActive() && selectedKernelNames.size === 1;
     roofGroup.selectAll(".roofline-path").each(function() {
       const idx = +d3.select(this).attr("data-idx");
       const key = cacheKeys[idx];
       const inSel = !filterOn || selectedRooflineKeys.has(key);
-      const baseW = idx === r ? 3 : 1;
+      const baseW = (singleKernelSelected || idx === r) ? 3 : 1;
       const sel = d3.select(this);
       if (!inSel) {
         sel.attr("stroke-width", 1).attr("opacity", 0.18);
@@ -1873,6 +1957,7 @@ __D3_SCRIPT__
   function updateLegend() {
     const r = currentMode().region;
     const filterOn = rooflineFilterActive();
+    const singleKernelSelected = kernelFilterActive() && selectedKernelNames.size === 1;
     legendG.selectAll("g.lrow").each(function(d, i) {
       const key = d;
       const inSel = !filterOn || selectedRooflineKeys.has(key);
@@ -1882,7 +1967,7 @@ __D3_SCRIPT__
         line.attr("stroke-width", 1).attr("opacity", 0.35);
         text.attr("opacity", 0.45);
       } else {
-        line.attr("opacity", 1).attr("stroke-width", i === r ? 3 : 1);
+        line.attr("opacity", 1).attr("stroke-width", (singleKernelSelected || i === r) ? 3 : 1);
         text.attr("opacity", 1);
       }
       text.text(d + (i === r ? " (AI axis)" : ""));
@@ -2371,6 +2456,7 @@ __D3_SCRIPT__
   document.getElementById("btn-export-png").addEventListener("click", exportPng);
 
   function onViewControlsChange() {
+    if (memSel.value !== "all") lastRegionIndex = +memSel.value;
     redraw();
   }
   memSel.addEventListener("change", onViewControlsChange);
@@ -2544,10 +2630,10 @@ def extract(
     df = pd.merge(df, totalBwVl1d, on='KernelName')
     df = pd.merge(df, totalBwLds, on='KernelName')
     # Recalculate arithmetic intensity for aggregated kernels
-    df['AI_HBM_TOT'] = df['TOTAL_OPS'] / df['BW_HBM']
-    df['AI_L2_TOT'] = df['TOTAL_OPS'] / df['BW_L2']
-    df['AI_vL1d_TOT'] = df['TOTAL_OPS'] / df['BW_vL1d']
-    df['AI_LDS_TOT'] = df['TOTAL_OPS'] / df['BW_LDS']
+    df['AI_HBM_TOT'] = _safe_divide(df['TOTAL_OPS'], df['BW_HBM'])
+    df['AI_L2_TOT'] = _safe_divide(df['TOTAL_OPS'], df['BW_L2'])
+    df['AI_vL1d_TOT'] = _safe_divide(df['TOTAL_OPS'], df['BW_vL1d'])
+    df['AI_LDS_TOT'] = _safe_divide(df['TOTAL_OPS'], df['BW_LDS'])
     # Recalculate peaks for aggregated kernels
     df['HBM_BW_PEAK'] = df['AI_HBM_TOT'] * caches[arch]['HBM']
     df['HBM_BW_PEAK_LINEAR'] = df['HBM_BW_PEAK']
@@ -2641,10 +2727,10 @@ def extract(
         print("  Total bytes moved (LDS):".ljust(33), _format_byte_size(row['BW_LDS']))
         print()
 
-        print("  Arithmetic intensity (HBM):".ljust(33), round(row['AI_HBM_TOT'], 4), " FLOPs/B")
-        print("  Arithmetic intensity (L2):".ljust(33), round(row['AI_L2_TOT'], 4), " FLOPs/B")
-        print("  Arithmetic intensity (L1):".ljust(33), round(row['AI_vL1d_TOT'], 4), " FLOPs/B")
-        print("  Arithmetic intensity (LDS):".ljust(33), round(row['AI_LDS_TOT'], 4), " FLOPs/B")
+        print("  Arithmetic intensity (HBM):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BW_HBM']), " FLOPs/B")
+        print("  Arithmetic intensity (L2):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BW_L2']), " FLOPs/B")
+        print("  Arithmetic intensity (vL1d):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BW_vL1d']), " FLOPs/B")
+        print("  Arithmetic intensity (LDS):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BW_LDS']), " FLOPs/B")
         print()
 
         if 'KERNEL_COMPUTE' in row['LIMITER']:
