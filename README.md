@@ -36,6 +36,37 @@ python3 profile_app.py -o my_results --arch MI355X -- ./my_app
 
 All output files (counters, traces, plots, analysis) will be saved in the specified output directory.
 
+### Multi-Rank (MPI) Runs
+`profile_app.py` handles multi-rank / multi-process MPI jobs automatically. Just place your normal MPI launch command after the `--` separator, exactly as you would run the application yourself:
+
+```bash
+python3 profile_app.py -o my_mpi_results -- mpirun -np 4 ./my_app arg1 arg2
+```
+
+Supported launchers (auto-detected as the first token of the run command): `mpirun`, `mpiexec`, `srun`, `aprun`, `jsrun`.
+
+**How it works:** Wrapping `rocprofv3` *around* the launcher would make every rank write to the same output file, producing corrupt, interleaved CSVs. To avoid this, when a launcher is detected the script instead invokes `rocprofv3` *inside* the launcher (once per rank). Each rank derives a unique id from its MPI environment (e.g. `OMPI_COMM_WORLD_RANK`, `PMI_RANK`, `PMIX_RANK`, `SLURM_PROCID`, `MV2_COMM_WORLD_RANK`, falling back to the shell PID) and writes to its own directory:
+
+```text
+my_mpi_results/
+  mpi_counters/
+    rank_0/pmc_1/..._counter_collection.csv
+    rank_1/pmc_1/..._counter_collection.csv
+    ...
+  mpi_trace/
+    rank_0/trace_kernel_trace.csv
+    rank_1/trace_kernel_trace.csv
+    ...
+```
+
+The script then:
+- Merges the per-rank kernel-trace CSVs into a single `trace_kernel_trace.csv`.
+- Combines all per-rank `*_counter_collection.csv` files (found recursively under `mpi_counters/`) into a single `counters.csv` during the conversion step.
+- Runs `rooflineExtractor.py` on the combined data, so all ranks are analyzed together as one workload.
+
+**Notes:**
+- Pass the launcher and all of its flags (e.g. `-np`, `--ntasks`, `-host`, `--bind-to`) after `--`; they are forwarded unchanged to the launcher.
+
 ## Option 2: Manual Profiling
 If you prefer to run the profiling steps manually:
 
@@ -50,6 +81,8 @@ The following two runs of rocprofv3 are needed to use rooflineExtractor:
   * This run gathers timing information for the application
   * `rocprofv3 --kernel-trace -f csv -- <exe>`
     * **Note:** The `-f csv` flag is only recognized in ROCm 7 and later. For older versions, omit this flag.
+
+> **Multi-rank (MPI) runs:** Do **not** wrap the MPI launcher (e.g. `rocprofv3 ... -- mpirun ...`), because every rank would write to the same output file and corrupt it. Instead, invoke `rocprofv3` *inside* the launcher so each rank profiles itself into a unique output directory, e.g. `mpirun -np 4 rocprofv3 -i roof-counters-<arch>.txt -o counters -f csv -d rank_${OMPI_COMM_WORLD_RANK} -- <exe>`. Then point `convert-counters-collection-format.py` at the parent directory (it collects every `pmc_*/*counter_collection.csv` recursively) and concatenate the per-rank trace CSVs before running `rooflineExtractor.py`. The automated `profile_app.py` flow (see [Multi-Rank (MPI) Runs](#multi-rank-mpi-runs)) does all of this for you.
 
 ### Run rooflineExtractor (single application)
 Provide counter and trace CSVs with **`-c`** and **`-r`**, and the GPU architecture with **`--arch`**:

@@ -28,6 +28,7 @@ import subprocess
 import os
 import argparse
 import glob
+import shlex
 import shutil
 import logging
 import pdb
@@ -62,6 +63,107 @@ class LogWriter:
     def close(self):
         """Close the log file."""
         self.log_file.close()
+
+
+# Known MPI/job launchers whose presence indicates rocprofv3 must be invoked
+# *per rank* (with a unique output directory) rather than wrapping the launcher.
+MPI_LAUNCHERS = {"mpirun", "mpiexec", "srun", "aprun", "jsrun"}
+
+# Common launcher options that consume the next argv element as their value.
+# Used to skip past launcher options when locating the application binary.
+_LAUNCHER_VALUED_FLAGS = {
+    "-n", "-np", "--n", "--np",
+    "-c", "--cpus-per-task", "--cpus-per-rank",
+    "-N", "--ntasks-per-node", "--ntasks",
+    "-x",
+    "-host", "--host", "-H", "-hostfile", "--hostfile",
+    "-machinefile", "--machinefile",
+    "-bind-to", "--bind-to", "-map-by", "--map-by",
+    "-mca", "--mca", "-gmca", "--gmca",
+    "-rf", "-rankfile", "--rankfile",
+    "-output-filename", "--output-filename",
+    "-am", "--am", "-tune", "--tune",
+}
+
+# Shell fragment that derives a per-rank identifier from whichever MPI/job
+# env var the active launcher sets, falling back to the shell PID. Stored in
+# ``$rank`` for use later in the wrapper.
+_RANK_RESOLVE = (
+    'rank="${OMPI_COMM_WORLD_RANK:-'
+    '${PMI_RANK:-${PMIX_RANK:-${SLURM_PROCID:-'
+    '${MV2_COMM_WORLD_RANK:-$$}}}}}"; '
+)
+
+
+def split_launcher(run_command):
+    """Detect a leading MPI launcher in ``run_command``.
+
+    Returns ``(launcher_args, app_args)`` if the first token is a known
+    launcher, otherwise ``(None, run_command)``. ``launcher_args`` includes
+    the launcher itself and all of its options up to (but not including) the
+    application binary.
+    """
+    if not run_command:
+        return None, run_command
+    launcher_basename = os.path.basename(run_command[0])
+    if launcher_basename not in MPI_LAUNCHERS:
+        return None, run_command
+    i = 1
+    while i < len(run_command):
+        arg = run_command[i]
+        if arg.startswith("-"):
+            if "=" in arg:
+                # --flag=value style, single token
+                i += 1
+                continue
+            if arg in _LAUNCHER_VALUED_FLAGS:
+                i += 2
+                continue
+            # Treat unknown dash-options as boolean flags.
+            i += 1
+            continue
+        # First non-flag token = application binary.
+        return run_command[:i], run_command[i:]
+    # All tokens consumed as launcher options; no app found. Don't wrap.
+    return None, run_command
+
+
+def build_rocprof_command(run_command, rocprof_args, per_rank_parent=None):
+    """Build the command list to invoke rocprofv3.
+
+    When ``run_command`` starts with an MPI launcher, rocprofv3 is placed
+    *inside* the launcher via a small ``bash -c`` wrapper. The wrapper
+    derives a per-rank id (falling back to the shell PID) and, if
+    ``per_rank_parent`` is given, ``cd``s into ``<per_rank_parent>/rank_<id>``
+    before exec'ing rocprofv3. This ensures rocprofv3's native ``pmc_N/``
+    output layout lands in a unique directory per rank.
+
+    Without an MPI launcher, rocprofv3 wraps ``run_command`` directly
+    (legacy behavior); ``per_rank_parent`` is ignored.
+
+    ``rocprof_args`` is the argv passed to rocprofv3 (excluding the program
+    name and the trailing ``--`` separator). All file paths inside it must
+    be absolute, since the wrapper may change the working directory.
+    """
+    launcher_args, app_args = split_launcher(run_command)
+    if launcher_args is None:
+        return ["rocprofv3"] + rocprof_args + ["--"] + run_command
+    quoted = " ".join(shlex.quote(a) for a in rocprof_args)
+    cd_fragment = ""
+    if per_rank_parent is not None:
+        quoted_parent = shlex.quote(per_rank_parent)
+        cd_fragment = (
+            f'outdir={quoted_parent}/rank_"$rank"; '
+            'mkdir -p "$outdir" && cd "$outdir" || exit 1; '
+        )
+    wrapper = (
+        _RANK_RESOLVE
+        + cd_fragment
+        + f'exec rocprofv3 {quoted} -- "$@"'
+    )
+    # The token immediately after ``-c <script>`` becomes ``$0`` inside the
+    # script; the rest become ``$1``, ``$2``, ... which we forward via "$@".
+    return launcher_args + ["bash", "-c", wrapper, "bash"] + app_args
 
 
 def run_rocprofv3_with_retry(cmd_with_csv, cmd_without_csv, cwd, logger=None):
@@ -294,18 +396,55 @@ def main():
     logger.write(f"Output directory: {output_dir}")
     logger.write(f"Log file: {log_file_path}")
     logger.write("=" * 80)
+
+    # Clean up any rocprofv3 output left over from a previous run in the same
+    # output directory. Stale pmc_*/ counter dirs or mpi_counters/mpi_trace
+    # trees would otherwise get mixed with (or block moving in) the new
+    # results. This intentionally leaves logs and other files untouched.
+    stale_entries = sorted(glob.glob(os.path.join(output_dir, 'pmc_*')))
+    for name in ('mpi_counters', 'mpi_trace'):
+        candidate = os.path.join(output_dir, name)
+        if os.path.exists(candidate):
+            stale_entries.append(candidate)
+    if stale_entries:
+        logger.write("Removing existing rocprofv3 output from previous run(s)...")
+        for entry in stale_entries:
+            logger.write(f"  Removing {entry}")
+            if os.path.isdir(entry) and not os.path.islink(entry):
+                shutil.rmtree(entry)
+            else:
+                os.remove(entry)
+        logger.write("=" * 80)
     
+    # Detect MPI launcher so we can profile each rank separately. Running
+    # rocprofv3 around mpirun (single profiler wrapping the launcher) causes
+    # every rank to write the same counters_counter_collection.csv, which
+    # corrupts the file via interleaved writes.
+    mpi_used = split_launcher(run_command)[0] is not None
+    if mpi_used:
+        logger.write(
+            "Detected MPI launcher; profiling each rank separately with per-rank rocprofv3 outputs."
+        )
+
     # Run rocprofv3 with counter collection
-    # Update message based on the selected counter input file
-    plural = "runs"
+    # Base the message on the number of pmc passes in the selected counter input file
     with open(counter_input_file, 'r', encoding='utf-8') as counter_file:
         n_runs = sum(1 for line in counter_file if line.strip().startswith('pmc:'))
-    logger.write(f"\n[1/4] Running rocprofv3 with counter collection ({n_runs} {plural} of the application)...")
-    logger.write(f"Command: rocprofv3 -i {counter_input_file} -o counters -f csv -- {run_command_str}")
+    logger.write(f"\n[1/4] Running rocprofv3 with counter collection ({n_runs} runs of the application)...")
+
+    counter_rocprof_args_csv = ['-i', counter_input_file, '-o', 'counters', '-f', 'csv']
+    counter_rocprof_args_nocsv = ['-i', counter_input_file, '-o', 'counters']
+    counter_per_rank_parent = 'mpi_counters' if mpi_used else None
+
+    counter_cmd_with_csv = build_rocprof_command(
+        run_command, counter_rocprof_args_csv, per_rank_parent=counter_per_rank_parent
+    )
+    counter_cmd_without_csv = build_rocprof_command(
+        run_command, counter_rocprof_args_nocsv, per_rank_parent=counter_per_rank_parent
+    )
+
+    logger.write(f"Command: {' '.join(counter_cmd_with_csv)}")
     logger.write("-" * 80)
-    
-    counter_cmd_with_csv = ['rocprofv3', '-i', counter_input_file, '-o', 'counters', '-f', 'csv', '--'] + run_command
-    counter_cmd_without_csv = ['rocprofv3', '-i', counter_input_file, '-o', 'counters', '--'] + run_command
     try:
         result1 = run_rocprofv3_with_retry(counter_cmd_with_csv, counter_cmd_without_csv, None, logger)
         if result1.returncode != 0:
@@ -314,32 +453,51 @@ def main():
             sys.exit(1)
         else:
             logger.write("Counter collection completed successfully")
-            # Move counter output directories to output_dir
-            for counter_dir in glob.glob('pmc_*'):
-                logger.write(f"Moving {counter_dir} to {output_dir}")
-                try:
-                    shutil.move(counter_dir, output_dir)
-                except shutil.Error as e:
-                    # If the destination exists, move files individually
-                    if "already exists" in str(e):
-                        logger.write(f"Warning: {counter_dir} already exists in {output_dir}, moving files individually.")
-                        dest_dir = os.path.join(output_dir, os.path.basename(counter_dir))
-                        for item in os.listdir(counter_dir):
-                            src_item = os.path.join(counter_dir, item)
-                            dest_item = os.path.join(dest_dir, item)
+            if mpi_used:
+                # Move the per-rank parent directory (containing rank_*/pmc_*/...)
+                if os.path.isdir('mpi_counters'):
+                    dest_root = os.path.join(output_dir, 'mpi_counters')
+                    logger.write(f"Moving mpi_counters to {dest_root}")
+                    if os.path.isdir(dest_root):
+                        for item in os.listdir('mpi_counters'):
+                            src_item = os.path.join('mpi_counters', item)
+                            dest_item = os.path.join(dest_root, item)
                             logger.write(f"  Moving {src_item} to {dest_item}")
                             shutil.move(src_item, dest_item)
-                        # Remove the now-empty source directory
-                        os.rmdir(counter_dir)
+                        os.rmdir('mpi_counters')
                     else:
-                        raise
-            # Also move any other counters* files that may exist
-            for counter_file in glob.glob('counters*'):
-                dest = os.path.join(output_dir, counter_file)
-                logger.write(f"Moving {counter_file} to {dest}")
-                shutil.move(counter_file, dest)
-    except FileNotFoundError:
-        logger.write("Error: rocprofv3 not found. Make sure it's installed and in your PATH.")
+                        shutil.move('mpi_counters', dest_root)
+            else:
+                # Move counter output directories to output_dir
+                for counter_dir in glob.glob('pmc_*'):
+                    logger.write(f"Moving {counter_dir} to {output_dir}")
+                    try:
+                        shutil.move(counter_dir, output_dir)
+                    except shutil.Error as e:
+                        # If the destination exists, move files individually
+                        if "already exists" in str(e):
+                            logger.write(f"Warning: {counter_dir} already exists in {output_dir}, moving files individually.")
+                            dest_dir = os.path.join(output_dir, os.path.basename(counter_dir))
+                            for item in os.listdir(counter_dir):
+                                src_item = os.path.join(counter_dir, item)
+                                dest_item = os.path.join(dest_dir, item)
+                                logger.write(f"  Moving {src_item} to {dest_item}")
+                                shutil.move(src_item, dest_item)
+                            # Remove the now-empty source directory
+                            os.rmdir(counter_dir)
+                        else:
+                            raise
+                # Also move any other counters* files that may exist
+                for counter_file in glob.glob('counters*'):
+                    dest = os.path.join(output_dir, counter_file)
+                    logger.write(f"Moving {counter_file} to {dest}")
+                    shutil.move(counter_file, dest)
+    except FileNotFoundError as e:
+        # The missing executable is whatever subprocess tried to launch first,
+        # i.e. the MPI launcher (mpirun/srun/...) when wrapping an MPI job, or
+        # rocprofv3 otherwise. Report the actual name from the exception.
+        missing = getattr(e, 'filename', None) or counter_cmd_with_csv[0]
+        logger.write(f"Error: {missing} not found. Make sure it's installed and in your PATH.")
         logger.close()
         sys.exit(1)
     except Exception as e:
@@ -351,12 +509,13 @@ def main():
     
     # Convert counter collection format
     logger.write("\n[2/4] Converting counter collection format...")
-    logger.write(f"Command: cd {output_dir} && python3 {conversion_script} -i . -o counters.csv")
+    counters_csv_path = os.path.join(output_dir, 'counters.csv')
+    convert_cmd = ['python3', conversion_script, '-i', output_dir, '-o', counters_csv_path]
+    logger.write(f"Command: python3 {' '.join(convert_cmd[1:])}")
     logger.write("-" * 80)
     
-    convert_cmd = ['python3', conversion_script, '-i', '.', '-o', 'counters.csv']
     try:
-        result2 = subprocess.run(convert_cmd, cwd=output_dir, check=False,
+        result2 = subprocess.run(convert_cmd, check=False,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
                                 universal_newlines=True)
         
@@ -385,11 +544,20 @@ def main():
     
     # Run rocprofv3 with kernel tracing
     logger.write("\n[3/4] Running rocprofv3 with kernel tracing (one run of the application)...")
-    logger.write(f"Command: rocprofv3 --kernel-trace -o trace -f csv -- {run_command_str}")
+
+    trace_rocprof_args_csv = ['--kernel-trace', '-o', 'trace', '-f', 'csv']
+    trace_rocprof_args_nocsv = ['--kernel-trace', '-o', 'trace']
+    trace_per_rank_parent = 'mpi_trace' if mpi_used else None
+
+    trace_cmd_with_csv = build_rocprof_command(
+        run_command, trace_rocprof_args_csv, per_rank_parent=trace_per_rank_parent
+    )
+    trace_cmd_without_csv = build_rocprof_command(
+        run_command, trace_rocprof_args_nocsv, per_rank_parent=trace_per_rank_parent
+    )
+
+    logger.write(f"Command: {' '.join(trace_cmd_with_csv)}")
     logger.write("-" * 80)
-    
-    trace_cmd_with_csv = ['rocprofv3', '--kernel-trace', '-o', 'trace', '-f', 'csv', '--'] + run_command
-    trace_cmd_without_csv = ['rocprofv3', '--kernel-trace', '-o', 'trace', '--'] + run_command
     try:
         result3 = run_rocprofv3_with_retry(trace_cmd_with_csv, trace_cmd_without_csv, None, logger)
         if result3.returncode != 0:
@@ -398,11 +566,51 @@ def main():
             sys.exit(1)
         else:
             logger.write("Kernel tracing completed successfully")
-            # Move trace output files to output_dir
-            for trace_file in glob.glob('trace*'):
-                dest = os.path.join(output_dir, trace_file)
-                logger.write(f"Moving {trace_file} to {dest}")
-                shutil.move(trace_file, dest)
+            if mpi_used:
+                # Move the per-rank trace tree under output_dir
+                if os.path.isdir('mpi_trace'):
+                    dest_root = os.path.join(output_dir, 'mpi_trace')
+                    logger.write(f"Moving mpi_trace to {dest_root}")
+                    if os.path.isdir(dest_root):
+                        for item in os.listdir('mpi_trace'):
+                            src_item = os.path.join('mpi_trace', item)
+                            dest_item = os.path.join(dest_root, item)
+                            logger.write(f"  Moving {src_item} to {dest_item}")
+                            shutil.move(src_item, dest_item)
+                        os.rmdir('mpi_trace')
+                    else:
+                        shutil.move('mpi_trace', dest_root)
+                # Concatenate per-rank trace CSVs into a single trace_kernel_trace.csv
+                # so the downstream rooflineExtractor step finds the file it expects.
+                per_rank_traces = sorted(glob.glob(os.path.join(
+                    output_dir, 'mpi_trace', 'rank_*', 'trace_kernel_trace.csv')))
+                if per_rank_traces:
+                    logger.write(
+                        f"Merging {len(per_rank_traces)} per-rank kernel-trace CSV(s) into trace_kernel_trace.csv"
+                    )
+                    per_rank_frames = []
+                    for p in per_rank_traces:
+                        rank_df = pd.read_csv(p)
+                        # Tag with the rank (parent dir name, e.g. "rank_0") so the
+                        # downstream rooflineExtractor merge keys on Application and
+                        # keeps each rank's Dispatch_Id distinct. This must match the
+                        # Application tag added to the per-rank counters.
+                        rank_df['Application'] = os.path.basename(os.path.dirname(p))
+                        per_rank_frames.append(rank_df)
+                    merged = pd.concat(per_rank_frames, ignore_index=True)
+                    merged.to_csv(
+                        os.path.join(output_dir, 'trace_kernel_trace.csv'), index=False
+                    )
+                else:
+                    logger.write(
+                        "Warning: no per-rank trace_kernel_trace.csv files found to merge."
+                    )
+            else:
+                # Move trace output files to output_dir
+                for trace_file in glob.glob('trace*'):
+                    dest = os.path.join(output_dir, trace_file)
+                    logger.write(f"Moving {trace_file} to {dest}")
+                    shutil.move(trace_file, dest)
     except Exception as e:
         logger.write(f"Error running kernel tracing: {e}")
         logger.close()
@@ -416,7 +624,7 @@ def main():
     # Build roofline command with arch flags
     roofline_cmd = ['python3', roofline_script, '-c', os.path.join(output_dir, 'counters.csv'), '-r', os.path.join(output_dir, 'trace_kernel_trace.csv'), '-p', '-d', '--arch', detected_gpu]
     
-    logger.write(f"Command: cd {original_dir} && python3 {' '.join(roofline_cmd[1:])}")
+    logger.write(f"Command: python3 {' '.join(roofline_cmd[1:])}")
     logger.write("-" * 80)
     try:
         result4 = subprocess.run(roofline_cmd, cwd=original_dir, check=False,

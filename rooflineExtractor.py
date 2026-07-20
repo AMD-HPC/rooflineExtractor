@@ -52,6 +52,65 @@ _caches_df = pd.read_csv(_caches_path, index_col="Architecture")
 caches = _caches_df.to_dict(orient="index")
 
 
+def read_rocprof_csv(file_path):
+    """Read a rocprofv3 counter/trace CSV, tolerating corrupt lines.
+
+    rocprofv3 writes rows from multiple GPUs concurrently, which can
+    occasionally interleave two records onto a single physical line. Those
+    malformed lines would otherwise abort the whole run, so skip them.
+    """
+    skipped = []
+
+    def on_bad_line(line):
+        skipped.append(line)
+        return None
+
+    # The API for handling bad lines differs by pandas version:
+    #   - pandas >= 1.4 supports a callable passed to on_bad_lines
+    #   - pandas 1.3.x supports on_bad_lines="skip"
+    #   - pandas < 1.3 uses error_bad_lines/warn_bad_lines
+    # Try each in turn so this works across versions.
+    try:
+        df = pd.read_csv(file_path, engine="python", on_bad_lines=on_bad_line)
+    except TypeError:
+        try:
+            df = pd.read_csv(file_path, engine="python", on_bad_lines="skip")
+        except TypeError:
+            df = pd.read_csv(
+                file_path,
+                engine="python",
+                error_bad_lines=False,
+                warn_bad_lines=False,
+            )
+    if skipped:
+        print(f"WARNING: Skipped {len(skipped)} malformed line(s) in {file_path}")
+    return df
+
+
+def _warn_omitted_kernels(reason, omitted_total, total, omitted_by_rank=None, total_by_rank=None):
+    """Print the omitted-kernel warning, broken down per MPI rank when available.
+
+    For MPI runs the counters/traces carry an ``Application`` tag (``rank_<N>``),
+    so ``omitted_by_rank``/``total_by_rank`` are per-rank pandas Series and we
+    emit one line per rank. Otherwise a single aggregate line is printed.
+    """
+    if omitted_by_rank is not None:
+        for app in sorted(omitted_by_rank.index):
+            n_omitted = int(omitted_by_rank.get(app, 0))
+            if n_omitted <= 0:
+                continue
+            n_total = int(total_by_rank.get(app, 0)) if total_by_rank is not None else 0
+            print(
+                f"WARNING: [{app}] {n_omitted}/{n_total} kernels can't be analyzed "
+                f"due to {reason}. Attempting to continue without them."
+            )
+    else:
+        print(
+            f"WARNING: {omitted_total}/{total} kernels can't be analyzed "
+            f"due to {reason}. Attempting to continue without them."
+        )
+
+
 # Function to convert columns with type mismatches to integers
 def convert_columns_to_int(df):
     counters = ['SQ_INSTS_VALU_ADD_F16', 'SQ_INSTS_VALU_MUL_F16',       'SQ_INSTS_VALU_FMA_F16', 'SQ_INSTS_VALU_TRANS_F16',       'SQ_INSTS_VALU_ADD_F32', 'SQ_INSTS_VALU_MUL_F32',       'SQ_INSTS_VALU_FMA_F32', 'SQ_INSTS_VALU_TRANS_F32',       'SQ_INSTS_VALU_ADD_F64', 'SQ_INSTS_VALU_MUL_F64',       'SQ_INSTS_VALU_FMA_F64', 'SQ_INSTS_VALU_TRANS_F64',       'SQ_INSTS_VALU_MFMA_MOPS_F16', 'SQ_INSTS_VALU_MFMA_MOPS_BF16',       'SQ_INSTS_VALU_MFMA_MOPS_F32', 'SQ_INSTS_VALU_MFMA_MOPS_F64', 'SQ_LDS_IDX_ACTIVE', 'SQ_LDS_BANK_CONFLICT',       'TCP_TCC_READ_REQ_sum', 'TCP_TCC_WRITE_REQ_sum',       'TCP_TCC_ATOMIC_WITH_RET_REQ_sum', 'TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum',       'TCP_TOTAL_CACHE_ACCESSES_sum', 'SQ_INSTS_VALU_INT32',       'SQ_INSTS_VALU_INT64',  'SQ_INSTS_SALU']
@@ -117,8 +176,8 @@ def load_from_directory(dir_path):
         if not c.is_file() or not t.is_file():
             print(f"Skipping {sub.name}: missing counters.csv or trace_kernel_trace.csv")
             continue
-        dfr = pd.read_csv(c)
-        dft = pd.read_csv(t)
+        dfr = read_rocprof_csv(c)
+        dft = read_rocprof_csv(t)
         dfr["Application"] = sub.name
         dft["Application"] = sub.name
         roof_parts.append(dfr)
@@ -2487,7 +2546,7 @@ def extract(
         last_dot = counter.rfind(".")
         file_stem = counter[:last_dot] if last_dot >= 0 else counter
         roofCountFilename = file_stem
-        df_roof = pd.read_csv(counter)
+        df_roof = read_rocprof_csv(counter)
     elif isinstance(counter, pd.DataFrame):
         if output_stem is not None:
             file_stem = output_stem
@@ -2523,16 +2582,29 @@ def extract(
         if "Application" in df_roof.columns
         else [dispatch_id_col]
     )
-    total_kernels = df_roof[dispatch_id_cols].drop_duplicates().shape[0]
+    unique_dispatches = df_roof[dispatch_id_cols].drop_duplicates()
+    total_kernels = unique_dispatches.shape[0]
+    # For MPI runs the counters carry a per-rank "Application" tag; capture the
+    # per-rank kernel totals up front so omitted-kernel warnings can be reported
+    # per rank (df_roof is filtered/merged further down).
+    has_rank = "Application" in dispatch_id_cols and "Application" in df_roof.columns
+    total_kernels_by_rank = (
+        unique_dispatches.groupby("Application").size() if has_rank else None
+    )
 
     # Check for 'None' values and remove them
     bad_row_mask = df_roof.isnull().any(axis=1) | (df_roof == 'None').any(axis=1)
-    total_omitted_kernels_round_1 = (
-        df_roof.loc[bad_row_mask, dispatch_id_cols].drop_duplicates().shape[0]
-    )
+    bad_unique = df_roof.loc[bad_row_mask, dispatch_id_cols].drop_duplicates()
+    total_omitted_kernels_round_1 = bad_unique.shape[0]
 
     if total_omitted_kernels_round_1 > 0:
-        print(f'WARNING: {total_omitted_kernels_round_1}/{total_kernels} kernels can\'t be analyzed due to non-deterministic runs during counter collection. Attempting to continue without them.')
+        _warn_omitted_kernels(
+            "non-deterministic runs during counter collection",
+            total_omitted_kernels_round_1,
+            total_kernels,
+            omitted_by_rank=(bad_unique.groupby("Application").size() if has_rank else None),
+            total_by_rank=total_kernels_by_rank,
+        )
         # Materialize a fresh DataFrame so downstream column assignments (e.g.
         # in convert_columns_to_int) don't trigger SettingWithCopyWarning.
         df_roof = df_roof[~bad_row_mask].copy()
@@ -2554,7 +2626,7 @@ def extract(
 
     # Get runtime stats
     if isinstance(results, str):
-        df_runtime = pd.read_csv(results)
+        df_runtime = read_rocprof_csv(results)
     elif isinstance(results, pd.DataFrame):
         df_runtime = results
     else:
@@ -2585,16 +2657,29 @@ def extract(
         df_runtime = df_runtime[df_runtime['DurationNs'] >= 0]
         print(f"WARNING: {negative_duration}/{total_kernels} kernel-trace rows removed for having an end timestamp before the start timestamp. Attempting to continue without them.")
 
-    pre_merge_unique_kernels = df_roof[dispatch_id_cols].drop_duplicates().shape[0]
+    pre_merge_unique = df_roof[dispatch_id_cols].drop_duplicates()
+    pre_merge_unique_kernels = pre_merge_unique.shape[0]
 
     # Merge runtimes into df_roof to get per-dispatch weight (Percentage of total runtime)
     df_roof = df_roof.merge(df_runtime[indexes + ['DurationNs']], on=indexes)
 
-    post_merge_unique_kernels = df_roof[dispatch_id_cols].drop_duplicates().shape[0]
+    post_merge_unique = df_roof[dispatch_id_cols].drop_duplicates()
+    post_merge_unique_kernels = post_merge_unique.shape[0]
     total_omitted_kernels_round_2 = pre_merge_unique_kernels - post_merge_unique_kernels
 
     if total_omitted_kernels_round_2 > 0:
-        print(f"WARNING: {total_omitted_kernels_round_2}/{total_kernels} kernels can't be analyzed due to non-deterministic runs between counter collection and timing. Attempting to continue without them.")
+        omitted_round_2_by_rank = None
+        if has_rank:
+            pre_by_rank = pre_merge_unique.groupby("Application").size()
+            post_by_rank = post_merge_unique.groupby("Application").size()
+            omitted_round_2_by_rank = pre_by_rank.subtract(post_by_rank, fill_value=0)
+        _warn_omitted_kernels(
+            "non-deterministic runs between counter collection and timing",
+            total_omitted_kernels_round_2,
+            total_kernels,
+            omitted_by_rank=omitted_round_2_by_rank,
+            total_by_rank=total_kernels_by_rank,
+        )
 
     df_roof['Percentage'] = df_roof['DurationNs'] / df_roof['DurationNs'].sum() * 100
 

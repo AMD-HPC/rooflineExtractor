@@ -4,18 +4,63 @@
 
 #!/usr/bin/env python3
 import os
+import re
 import pandas as pd
 import argparse
 import logging
 
 
+# rocprofv3 writes per-rank MPI output under ``.../rank_<N>/pmc_*/...`` (see
+# profile_app.py's build_rocprof_command). Detect that rank id from the file
+# path so each rank's counters can be qualified with an ``Application`` column,
+# which keeps otherwise-identical Dispatch_Id values from different ranks from
+# collapsing together downstream.
+_RANK_DIR_RE = re.compile(r"(?:^|/)rank_(\d+)(?:/|$)")
+
+
+def rank_from_path(file_path):
+    match = _RANK_DIR_RE.search(file_path.replace(os.sep, "/"))
+    if match:
+        return f"rank_{match.group(1)}"
+    return None
+
+
 def read_csv(file_path):
     df = pd.DataFrame()
+    skipped = []
+
+    def on_bad_line(line):
+        skipped.append(line)
+        return None
+
+    # rocprofv3 writes counter rows from multiple GPUs concurrently, which
+    # can occasionally interleave two records onto a single physical line.
+    # Skip those corrupt lines instead of failing the whole conversion.
+    #
+    # The API for handling bad lines differs by pandas version:
+    #   - pandas >= 1.4 supports a callable passed to on_bad_lines
+    #   - pandas 1.3.x supports on_bad_lines="skip"
+    #   - pandas < 1.3 uses error_bad_lines/warn_bad_lines
+    # Try each in turn so the conversion works across versions.
     try:
-        df = pd.read_csv(file_path)
+        df = pd.read_csv(file_path, engine="python", on_bad_lines=on_bad_line)
+    except TypeError:
+        try:
+            df = pd.read_csv(file_path, engine="python", on_bad_lines="skip")
+        except TypeError:
+            df = pd.read_csv(
+                file_path,
+                engine="python",
+                error_bad_lines=False,
+                warn_bad_lines=False,
+            )
     except Exception as e:
         logging.info(f"Error reading {file_path}: {e}")
         raise
+    if skipped:
+        logging.warning(
+            f"Skipped {len(skipped)} malformed line(s) in {file_path}"
+        )
     return df
 
 
@@ -42,7 +87,13 @@ def get_combined_df(args):
     logging.info(f"Processing files: {files_list}")
     combined_df = pd.DataFrame()
     for file in files_list:
-        combined_df = pd.concat([combined_df, read_csv(file)], ignore_index=True)
+        file_df = read_csv(file)
+        # Qualify each row with its MPI rank (when the file lives under a
+        # rank_<N> directory) so per-rank kernels stay distinct after merging.
+        rank = rank_from_path(file)
+        if rank is not None:
+            file_df["Application"] = rank
+        combined_df = pd.concat([combined_df, file_df], ignore_index=True)
     return combined_df
 
 
@@ -104,6 +155,34 @@ def main(args):
         "VGPR_Count",
         "Workgroup_Size",
     ]
+
+    # rocprofv3 emits the numeric index columns with inconsistent dtypes across
+    # PMC passes (e.g. Scratch_Size as int "0" in one pass and float "0.0" or
+    # string in another). After concatenation those columns become object dtype
+    # with mixed values that never compare equal, so the pivot would treat each
+    # pass as a separate group and fail to merge counters for the same kernel.
+    # Coerce them to a single nullable-integer type so identical kernels align.
+    numeric_indexes = [
+        "Dispatch_Id",
+        "Grid_Size",
+        "LDS_Block_Size",
+        "Queue_Id",
+        "SGPR_Count",
+        "Scratch_Size",
+        "VGPR_Count",
+        "Workgroup_Size",
+    ]
+    for col in numeric_indexes:
+        if col in input_df.columns:
+            input_df[col] = pd.to_numeric(input_df[col], errors="coerce").astype(
+                "Int64"
+            )
+
+    # Keep the per-rank Application tag (added in get_combined_df for MPI runs)
+    # as part of the pivot index so it survives into the output and qualifies
+    # each rank's Dispatch_Id downstream.
+    if "Application" in input_df.columns:
+        indexes = ["Application"] + indexes
 
     # Drop duplicate counters in multiple PMC lines
     input_df.drop_duplicates(
