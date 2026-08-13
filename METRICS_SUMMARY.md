@@ -10,7 +10,7 @@ The following data and their sources/tools are used to generate the metrics:
 - Kernel timing: rocprofv3 (independent run from counters)
 - Roofline peaks
   - Primary option
-    - benchWarmer (https://github.com/AMD-HPC-Internal/benchWarmer)
+    - benchWarmer (https://github.com/AMD-HPC/benchWarmer)
     - rocm-amdgpu-bench (https://github.com/ROCm/rocm-amdgpu-bench)
   - Secondary option (only used when hardware isn't available)
     - GPU specs pulled from internal spreadsheets

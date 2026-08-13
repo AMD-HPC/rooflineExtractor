@@ -50,11 +50,13 @@ Where:
 - `TOTAL_MOPS_F8 = 512 × SQ_INSTS_VALU_MFMA_MOPS_F8` (if available)
 - `TOTAL_MOPS_I8 = 512 × SQ_INSTS_VALU_MFMA_MOPS_I8` (if available)
 - `TOTAL_MOPS_F6F4 = 512 × SQ_INSTS_VALU_MFMA_MOPS_F6F4` (if available; gfx950 only)
+- `TOTAL_VALU_OTHER = 64 × (SQ_INSTS_VALU − Σ(VALU instruction counts) − Σ(MFMA instruction counts))`
+  - Captures VALU instructions not attributed to a typed category above (e.g. bitwise ops, INT16).
 
 **Notes**: 
 - The factor of 64 for VALU operations accounts for the wavefront size (64 threads per wavefront).
 - The factor of 2 for FMA operations accounts for both the multiply and add operations.
-- The factor of 512 for MFMA (Matrix FMA) operations accounts for the matrix dimensions.
+- The factor of 512 for MFMA (Matrix FMA) operations converts the `SQ_INSTS_VALU_MFMA_MOPS_*` counters (which report math operations ÷ 512) back to total math operations; these counters do not track instruction counts.
 
 ### Average GPU Time Per Dispatch
 
@@ -87,16 +89,16 @@ Where:
 
 ### Total Contribution to GPU time
 
-**Description**: The percentage of total, application-wide GPU time consumed by this kernel.
+**Description**: The percentage of total GPU time consumed by this kernel.
 
 **Equation**:
 ```
-Percentage = (RuntimeNs / TotalApplicationRuntime) × 100
+Percentage = (RuntimeNs / TotalGPURuntime) × 100
 ```
 
 Where:
 - `RuntimeNs` = Total runtime for this kernel
-- `TotalApplicationRuntime` = Sum of RuntimeNs across all kernels
+- `TotalGPURuntime` = Sum of RuntimeNs across all kernels
 
 ### Total Dispatches
 
@@ -112,22 +114,22 @@ Where:
 
 #### Arithmetic Intensity (HBM - High Bandwidth Memory)
 ```
-AI_HBM_TOT = TOTAL_OPS / BW_HBM
+AI_HBM_TOT = TOTAL_OPS / BYTES_HBM
 ```
 
 Where:
 ```
-BW_HBM (for gfx950) = 32 × TCC_EA0_WRREQ_WRITE_DRAM_32B_sum +
+BYTES_HBM (for gfx950) = 32 × TCC_EA0_WRREQ_WRITE_DRAM_32B_sum +
                       32 × TCC_EA0_RDREQ_DRAM_32B_sum +
                       32 × TCC_EA0_WRREQ_ATOMIC_DRAM_32B_sum
 
-BW_HBM (for gfx942) = 128 × TCC_BUBBLE_sum + 
+BYTES_HBM (for gfx942) = 128 × TCC_BUBBLE_sum + 
                               32 × TCC_EA0_RDREQ_32B_sum + 
                               64 × (TCC_EA0_RDREQ_sum - TCC_BUBBLE_sum - TCC_EA0_RDREQ_32B_sum) + 
                               32 × (TCC_EA0_WRREQ_sum - TCC_EA0_WRREQ_64B_sum) + 
                               64 × TCC_EA0_WRREQ_64B_sum
 
-BW_HBM (for gfx90a) = 32 × TCC_EA_RDREQ_32B_sum + 
+BYTES_HBM (for gfx90a) = 32 × TCC_EA_RDREQ_32B_sum + 
                       64 × (TCC_EA_RDREQ_sum - TCC_EA_RDREQ_32B_sum) + 
                       32 × (TCC_EA_WRREQ_sum - TCC_EA_WRREQ_64B_sum) + 
                       64 × TCC_EA_WRREQ_64B_sum
@@ -145,50 +147,40 @@ BW_HBM (for gfx90a) = 32 × TCC_EA_RDREQ_32B_sum +
 
 #### Arithmetic Intensity (L2 Cache)
 ```
-AI_L2_TOT = TOTAL_OPS / BW_L2
+AI_L2_TOT = TOTAL_OPS / BYTES_L2
 ```
 
 Where:
 ```
-BW_L2 (preferred) = 128 × TCC_REQ_sum
-
-BW_L2 (fallback) = 64 × TCP_TCC_READ_REQ_sum + 
-                   64 × TCP_TCC_WRITE_REQ_sum + 
-                   BW_LDS_ATOMICS
+BYTES_L2 = 128 × TCC_REQ_sum
 ```
 
 **Hardware Counters**:
 - `TCC_REQ_sum`: Total requests to L2 cache (preferred, more reliable)
-- `TCP_TCC_READ_REQ_sum`: Read requests from TCP to TCC
-- `TCP_TCC_WRITE_REQ_sum`: Write requests from TCP to TCC
 
 #### Arithmetic Intensity (vL1D - Vector L1 Data Cache)
 ```
-AI_vL1d_TOT = TOTAL_OPS / BW_vL1d
+AI_vL1d_TOT = TOTAL_OPS / BYTES_vL1d
 ```
 
 Where:
 ```
-BW_vL1d (preferred) = 256 × (SQ_INSTS_VMEM_WR + SQ_INSTS_VMEM_RD)
-
-BW_vL1d (fallback) = 128 × TCP_TOTAL_CACHE_ACCESSES_sum
+BYTES_vL1d = 64 × TCP_TOTAL_CACHE_ACCESSES_sum
 ```
 
 **Hardware Counters**:
-- `SQ_INSTS_VMEM_WR`: Vector memory write instructions
-- `SQ_INSTS_VMEM_RD`: Vector memory read instructions
-- `TCP_TOTAL_CACHE_ACCESSES_sum`: Total cache accesses (fallback)
+- `TCP_TOTAL_CACHE_ACCESSES_sum`: Total cache accesses
 
 #### Arithmetic Intensity (LDS - Local Data Share)
 ```
-AI_LDS_TOT = TOTAL_OPS / BW_LDS
+AI_LDS_TOT = TOTAL_OPS / BYTES_LDS
 ```
 
 Where:
 ```
-BW_LDS = 32 × 4 × (SQ_LDS_IDX_ACTIVE - SQ_LDS_BANK_CONFLICT)
+BYTES_LDS = 32 × 4 × (SQ_LDS_IDX_ACTIVE - SQ_LDS_BANK_CONFLICT)
 
-BW_LDS_ATOMICS = 64 × (TCP_TCC_ATOMIC_WITH_RET_REQ_sum + TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum)
+BYTES_LDS_ATOMICS = 64 × (TCP_TCC_ATOMIC_WITH_RET_REQ_sum + TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum)
 ```
 
 **Hardware Counters**:
@@ -326,15 +318,15 @@ Hardware counter: `SQ_INSTS_SALU`
 
 ### Matrix Operations (MFMA)
 
-Matrix Fused Multiply-Add operations, each counting 512 operations per instruction:
+Matrix Fused Multiply-Add (MFMA) math operations. Unlike the VALU counters above, the `SQ_INSTS_VALU_MFMA_MOPS_*` counters do **not** track instruction counts — they report the number of math operations performed, divided by 512. Multiplying by 512 recovers the total math operations. (Instruction counts are exposed by separate counters. The MOPS form is needed because a single precision can have several MFMA instruction variants that each perform a different number of math operations.)
 
-- **FP8**: `SQ_INSTS_VALU_MFMA_MOPS_F8` (× 512 ops/instruction, if available)
-- **INT8**: `SQ_INSTS_VALU_MFMA_MOPS_I8` (× 512 ops/instruction, if available)
-- **F6F4** (FP4/FP6 combined, gfx950 only): `SQ_INSTS_VALU_MFMA_MOPS_F6F4` (× 512 ops/instruction, if available). Uses the FP4 MFMA peak as the achievable upper bound.
-- **FP16**: `SQ_INSTS_VALU_MFMA_MOPS_F16` (× 512 ops/instruction)
-- **BF16**: `SQ_INSTS_VALU_MFMA_MOPS_BF16` (× 512 ops/instruction)
-- **FP32**: `SQ_INSTS_VALU_MFMA_MOPS_F32` (× 512 ops/instruction)
-- **FP64**: `SQ_INSTS_VALU_MFMA_MOPS_F64` (× 512 ops/instruction)
+- **FP8**: `SQ_INSTS_VALU_MFMA_MOPS_F8` × 512 (if available)
+- **INT8**: `SQ_INSTS_VALU_MFMA_MOPS_I8` × 512 (if available)
+- **F6F4** (FP4/FP6 combined, gfx950 only): `SQ_INSTS_VALU_MFMA_MOPS_F6F4` × 512 (if available). Uses the FP4 MFMA peak as the achievable upper bound.
+- **FP16**: `SQ_INSTS_VALU_MFMA_MOPS_F16` × 512
+- **BF16**: `SQ_INSTS_VALU_MFMA_MOPS_BF16` × 512
+- **FP32**: `SQ_INSTS_VALU_MFMA_MOPS_F32` × 512
+- **FP64**: `SQ_INSTS_VALU_MFMA_MOPS_F64` × 512
 
 ---
 
@@ -380,18 +372,14 @@ All bandwidth values are in bytes. The arithmetic intensities are in ops/byte (F
 - `SQ_INSTS_VALU`: Total vector ALU instructions
 - `SQ_INSTS_VALU_*`: Vector ALU instructions by type and precision
 - `SQ_INSTS_VALU_MFMA_MOPS_*`: Matrix multiply-accumulate operations
-- `SQ_INSTS_VMEM_WR`: Vector memory write instructions
-- `SQ_INSTS_VMEM_RD`: Vector memory read instructions
 
 #### Memory Counters
 - `SQ_LDS_IDX_ACTIVE`: Active LDS operations
 - `SQ_LDS_BANK_CONFLICT`: LDS bank conflicts
-- `TCP_TCC_READ_REQ_sum`: L1 to L2 read requests
-- `TCP_TCC_WRITE_REQ_sum`: L1 to L2 write requests
 - `TCP_TCC_ATOMIC_WITH_RET_REQ_sum`: Atomic operations with return
 - `TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum`: Atomic operations without return
 - `TCP_TOTAL_CACHE_ACCESSES_sum`: Total cache accesses
-- `TCC_REQ_sum`: Total L2 requests (preferred counter)
+- `TCC_REQ_sum`: Total L2 requests
 - `TCC_BUBBLE_sum`: L2 bubble cycles
 - `TCC_EA0_RDREQ_sum` / `TCC_EA_RDREQ_sum`: L2 to HBM read requests
 - `TCC_EA0_RDREQ_32B_sum` / `TCC_EA_RDREQ_32B_sum`: 32-byte read requests to HBM

@@ -319,7 +319,7 @@ def _compute_kernel_overlap_pct(df_runtime):
 
 def _compute_ai_columns(df, mem_level):
     """Compute arithmetic intensity columns for one memory hierarchy level."""
-    bw = df[f'BW_{mem_level}']
+    bw = df[f'BYTES_{mem_level}']
     cols = {}
     for suffix, total_col in [
         ('TOT', 'TOTAL_OPS'), ('SALU', 'TOTAL_SALU'),
@@ -802,20 +802,20 @@ def compute_flops(df, arch):
     new_columns = {}
     new_columns['TOTAL_OPS'] = TOTAL_OPS
 
-    # Compute Bandwidths
+    # Compute bytes moved per memory region
     ## LDS
-    new_columns['BW_LDS'] = 32 * 4 * (df['SQ_LDS_IDX_ACTIVE'] - df['SQ_LDS_BANK_CONFLICT'])
-    new_columns['BW_LDS_ATOMICS'] = 64 * (df['TCP_TCC_ATOMIC_WITH_RET_REQ_sum'] + df['TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum'])
+    new_columns['BYTES_LDS'] = 32 * 4 * (df['SQ_LDS_IDX_ACTIVE'] - df['SQ_LDS_BANK_CONFLICT'])
+    new_columns['BYTES_LDS_ATOMICS'] = 64 * (df['TCP_TCC_ATOMIC_WITH_RET_REQ_sum'] + df['TCP_TCC_ATOMIC_WITHOUT_RET_REQ_sum'])
 
     ## L2
     if 'TCC_REQ_sum' in df.columns:
-        new_columns['BW_L2'] = 128 * df['TCC_REQ_sum']
+        new_columns['BYTES_L2'] = 128 * df['TCC_REQ_sum']
     else:
         # Less reliable calculation kept to be backwards compatible with earlier rooflineExtractor versions
-        new_columns['BW_L2'] = 64 * df['TCP_TCC_READ_REQ_sum'] + 64 * df['TCP_TCC_WRITE_REQ_sum'] + new_columns['BW_LDS_ATOMICS']
+        new_columns['BYTES_L2'] = 64 * df['TCP_TCC_READ_REQ_sum'] + 64 * df['TCP_TCC_WRITE_REQ_sum'] + new_columns['BYTES_LDS_ATOMICS']
 
     ## vL1D
-    new_columns['BW_vL1d'] = 64 * df['TCP_TOTAL_CACHE_ACCESSES_sum']
+    new_columns['BYTES_vL1d'] = 64 * df['TCP_TOTAL_CACHE_ACCESSES_sum']
 
     ## HBM
     ### Check architecture
@@ -827,19 +827,19 @@ def compute_flops(df, arch):
     if ('MI35' in arch) and all(c in df.columns for c in _gfx950_hbm_dram):
         # Count 32-byte read, write, and atomic requests to HBM
         # 1 64-byte request will be counted as 2, 1 128-byte (read) will be counted as 4
-        new_columns['BW_HBM'] = (
+        new_columns['BYTES_HBM'] = (
             32 * df['TCC_EA0_WRREQ_WRITE_DRAM_32B_sum']
             + 32 * df['TCC_EA0_RDREQ_DRAM_32B_sum']
             + 32 * df['TCC_EA0_WRREQ_ATOMIC_DRAM_32B_sum']
         )
     elif df.keys().str.contains('TCC_BUBBLE').sum() > 0:
         # We have a gfx942 or gfx950 arch counter file (legacy HBM model without gfx950 DRAM 32B sums for backward compatibility)
-        new_columns['BW_HBM'] = 128 * df['TCC_BUBBLE_sum'] + 32 * df['TCC_EA0_RDREQ_32B_sum'] + 64 * (df['TCC_EA0_RDREQ_sum'] - df['TCC_BUBBLE_sum'] - df['TCC_EA0_RDREQ_32B_sum']) + 32 * (df['TCC_EA0_WRREQ_sum'] - df['TCC_EA0_WRREQ_64B_sum']) + 64 * df['TCC_EA0_WRREQ_64B_sum']
+        new_columns['BYTES_HBM'] = 128 * df['TCC_BUBBLE_sum'] + 32 * df['TCC_EA0_RDREQ_32B_sum'] + 64 * (df['TCC_EA0_RDREQ_sum'] - df['TCC_BUBBLE_sum'] - df['TCC_EA0_RDREQ_32B_sum']) + 32 * (df['TCC_EA0_WRREQ_sum'] - df['TCC_EA0_WRREQ_64B_sum']) + 64 * df['TCC_EA0_WRREQ_64B_sum']
     else:
         # Assuming gfx90a
-        new_columns['BW_HBM'] = 32 * df['TCC_EA_RDREQ_32B_sum'] + 64 * (df['TCC_EA_RDREQ_sum'] - df['TCC_EA_RDREQ_32B_sum']) + 32 * (df['TCC_EA_WRREQ_sum'] - df['TCC_EA_WRREQ_64B_sum']) + 64 * df['TCC_EA_WRREQ_64B_sum']
+        new_columns['BYTES_HBM'] = 32 * df['TCC_EA_RDREQ_32B_sum'] + 64 * (df['TCC_EA_RDREQ_sum'] - df['TCC_EA_RDREQ_32B_sum']) + 32 * (df['TCC_EA_WRREQ_sum'] - df['TCC_EA_WRREQ_64B_sum']) + 64 * df['TCC_EA_WRREQ_64B_sum']
 
-    # Concat bandwidth columns
+    # Concat byte-count columns
     df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
     # Compute AI for each part of memory hierarchy (HBM, L2, L1)
@@ -885,7 +885,7 @@ def compute_flops(df, arch):
                 df["KERNEL_COMPUTE_PEAK"],
                 alpha_base,
             ),
-            df["BW_HBM"],
+            df["BYTES_HBM"],
         )
         df["HBM_ALPHA"] = alpha_base
 
@@ -898,7 +898,7 @@ def compute_flops(df, arch):
                 df["KERNEL_COMPUTE_PEAK"],
                 lds_alpha_base,
             ),
-            df["BW_LDS"],
+            df["BYTES_LDS"],
         )
         df["LDS_ALPHA"] = lds_alpha_base
 
@@ -2683,13 +2683,16 @@ def extract(
 
     df_roof['Percentage'] = df_roof['DurationNs'] / df_roof['DurationNs'].sum() * 100
 
-    # Aggregate kernels with weighted average by percentage of total runtime
-    exclude = {'Percentage', 'DurationNs', 'TOTAL_OPS', 'BW_HBM', 'BW_L2', 'BW_vL1d', 'BW_LDS'}
+
+    # Aggregate kernels with an average across dispatches.
+    # Runtime columns are handled separately below, and
+    # arithmetic-intensity columns are recalculated from the averaged operation
+    # and byte counts rather than averaged directly (averaging ratios is wrong).
+    exclude = {
+        'Percentage', 'DurationNs'
+    }
     num_cols = [c for c in df_roof.select_dtypes(include=[np.number]).columns if c not in exclude]
-    weight_sum = df_roof.groupby('KernelName', sort=False)['Percentage'].sum()
-    df = (df_roof[num_cols].mul(df_roof['Percentage'], axis=0)
-          .groupby(df_roof['KernelName'], sort=False).sum()
-          .div(weight_sum, axis=0)).reset_index()
+    df = df_roof.groupby('KernelName', sort=False)[num_cols].mean().reset_index()
 
     # Calculate total, average, and percentage runtimes for aggregated kernels
     totalRuntimes = df_roof.groupby('KernelName')['DurationNs'].sum()
@@ -2703,22 +2706,10 @@ def extract(
 
     # Add column for number of dispatches
     df = df.merge(df_roof.groupby('KernelName', sort=False).size().reset_index(name='Count'), on='KernelName')
-    # Add total operations for aggregated kernels
-    totalOps = df_roof.groupby('KernelName')['TOTAL_OPS'].mean()
-    totalBwHbm = df_roof.groupby('KernelName')['BW_HBM'].mean()
-    totalBwL2 = df_roof.groupby('KernelName')['BW_L2'].mean()
-    totalBwVl1d = df_roof.groupby('KernelName')['BW_vL1d'].mean()
-    totalBwLds = df_roof.groupby('KernelName')['BW_LDS'].mean()
-    df = pd.merge(df, totalOps, on='KernelName')
-    df = pd.merge(df, totalBwHbm, on='KernelName')
-    df = pd.merge(df, totalBwL2, on='KernelName')
-    df = pd.merge(df, totalBwVl1d, on='KernelName')
-    df = pd.merge(df, totalBwLds, on='KernelName')
-    # Recalculate arithmetic intensity for aggregated kernels
-    df['AI_HBM_TOT'] = _safe_divide(df['TOTAL_OPS'], df['BW_HBM'])
-    df['AI_L2_TOT'] = _safe_divide(df['TOTAL_OPS'], df['BW_L2'])
-    df['AI_vL1d_TOT'] = _safe_divide(df['TOTAL_OPS'], df['BW_vL1d'])
-    df['AI_LDS_TOT'] = _safe_divide(df['TOTAL_OPS'], df['BW_LDS'])
+
+    # Recalculate arithmetic intensities from the averaged operation and byte counts
+    for mem_level in ['LDS', 'L2', 'vL1d', 'HBM']:
+        df = df.assign(**_compute_ai_columns(df, mem_level))
     # Recalculate peaks for aggregated kernels
     df['HBM_BW_PEAK'] = df['AI_HBM_TOT'] * caches[arch]['HBM']
     df['HBM_BW_PEAK_LINEAR'] = df['HBM_BW_PEAK']
@@ -2739,7 +2730,7 @@ def extract(
                 df["KERNEL_COMPUTE_PEAK"],
                 _alpha_agg,
             ),
-            df["BW_HBM"],
+            df["BYTES_HBM"],
         )
         df["HBM_ALPHA"] = _alpha_agg
 
@@ -2752,7 +2743,7 @@ def extract(
                 df["KERNEL_COMPUTE_PEAK"],
                 _alpha_lds_agg,
             ),
-            df["BW_LDS"],
+            df["BYTES_LDS"],
         )
         df["LDS_ALPHA"] = _alpha_lds_agg
 
@@ -2806,16 +2797,16 @@ def extract(
         print("  Total operations per dispatch:".ljust(33), "{:.3e}".format(row['TOTAL_OPS']), "FLOPs")
         print()
 
-        print("  Total bytes moved (HBM):".ljust(33), _format_byte_size(row['BW_HBM']))
-        print("  Total bytes moved (L2):".ljust(33), _format_byte_size(row['BW_L2']))
-        print("  Total bytes moved (L1):".ljust(33), _format_byte_size(row['BW_vL1d']))
-        print("  Total bytes moved (LDS):".ljust(33), _format_byte_size(row['BW_LDS']))
+        print("  Total bytes moved (HBM):".ljust(33), _format_byte_size(row['BYTES_HBM']))
+        print("  Total bytes moved (L2):".ljust(33), _format_byte_size(row['BYTES_L2']))
+        print("  Total bytes moved (vL1d):".ljust(33), _format_byte_size(row['BYTES_vL1d']))
+        print("  Total bytes moved (LDS):".ljust(33), _format_byte_size(row['BYTES_LDS']))
         print()
 
-        print("  Arithmetic intensity (HBM):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BW_HBM']), " FLOPs/B")
-        print("  Arithmetic intensity (L2):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BW_L2']), " FLOPs/B")
-        print("  Arithmetic intensity (vL1d):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BW_vL1d']), " FLOPs/B")
-        print("  Arithmetic intensity (LDS):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BW_LDS']), " FLOPs/B")
+        print("  Arithmetic intensity (HBM):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BYTES_HBM']), " FLOPs/B")
+        print("  Arithmetic intensity (L2):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BYTES_L2']), " FLOPs/B")
+        print("  Arithmetic intensity (vL1d):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BYTES_vL1d']), " FLOPs/B")
+        print("  Arithmetic intensity (LDS):".ljust(33), _format_ai(row['TOTAL_OPS'], row['BYTES_LDS']), " FLOPs/B")
         print()
 
         if 'KERNEL_COMPUTE' in row['LIMITER']:
@@ -2882,7 +2873,7 @@ def extract(
             if _lvl is not None and _lvl not in _mem_levels:
                 _mem_levels.append(_lvl)
         for _lvl in _mem_levels:
-            _achieved_bw = row[f"BW_{_lvl}"] / row["AverageNs"]
+            _achieved_bw = row[f"BYTES_{_lvl}"] / row["AverageNs"]
             print(
                 f"  Achieved {_lvl} bandwidth:".ljust(40),
                 _format_bandwidth(_achieved_bw),
