@@ -1661,7 +1661,8 @@ __D3_SCRIPT__
 
   function computeKernelsVisibleAtThreshold() {
     const t = th[thresholdIndex];
-    const key = regionKey();
+    // Under "All regions" a kernel is plotted if any region gives it a usable AI.
+    const keys = allRegionsActive() ? cacheKeys : [regionKey()];
     const agg = currentMode().aggregate;
     const src = agg ? data.aggregate : data.dispatch;
     const visible = new Set();
@@ -1669,8 +1670,11 @@ __D3_SCRIPT__
       const d = src[i];
       const c = d.cumulativePct;
       if (c == null || !Number.isFinite(c) || c > t) continue;
-      const a = d.ai[key];
-      if (a == null || !(a > 0) || !Number.isFinite(a)) continue;
+      const hasAi = keys.some(function(k) {
+        const a = d.ai[k];
+        return a != null && a > 0 && Number.isFinite(a);
+      });
+      if (!hasAi) continue;
       const tp = d.throughput;
       if (tp == null || !(tp > 0) || !Number.isFinite(tp)) continue;
       visible.add(d.kernelName);
@@ -1839,10 +1843,12 @@ __D3_SCRIPT__
   });
   memSel.value = "0";
 
-  // When a single kernel is selected its dots span every memory region, so the
-  // dropdown is switched to a disabled "All regions" state. lastRegionIndex
-  // remembers the user's chosen AI-axis region to restore afterward, and is also
-  // used as the effective region for internal calculations while "all" is shown.
+  // When a single kernel is selected, an extra "All regions" entry is added to the
+  // dropdown and picked by default, since that kernel can be plotted against every
+  // memory region at once. Choosing a single region from the dropdown narrows the
+  // kernel's dots back down to that region. lastRegionIndex remembers the chosen
+  // AI-axis region to restore afterward, and is also the effective region for
+  // internal calculations while "All regions" is selected.
   let lastRegionIndex = 0;
   let allRegionsOptionEl = null;
 
@@ -1855,28 +1861,42 @@ __D3_SCRIPT__
     return Number.isFinite(n) ? n : 0;
   }
 
+  /** True when the kernel's dots are plotted against every memory region at once. */
+  function allRegionsActive() {
+    return allRegionsOptionEl != null && memSel.value === "all";
+  }
+
   function syncMemRegionControl() {
     const single = kernelFilterActive() && selectedKernelNames.size === 1;
     if (single) {
       if (memSel.value !== "all") lastRegionIndex = +memSel.value;
       if (!allRegionsOptionEl) {
+        // Entering single-kernel mode: offer all regions at once, and start there.
         allRegionsOptionEl = document.createElement("option");
         allRegionsOptionEl.value = "all";
         allRegionsOptionEl.textContent = "All regions";
-        memSel.appendChild(allRegionsOptionEl);
+        memSel.insertBefore(allRegionsOptionEl, memSel.firstChild);
+        memSel.value = "all";
       }
-      memSel.value = "all";
-      memSel.disabled = true;
-      memSel.title = "All memory regions are shown for the selected kernel";
+      memSel.title = "Plot the selected kernel against every memory region, or pick one";
     } else {
       if (allRegionsOptionEl) {
         if (memSel.value === "all") memSel.value = String(lastRegionIndex);
         allRegionsOptionEl.remove();
         allRegionsOptionEl = null;
       }
-      memSel.disabled = false;
       memSel.title = "";
     }
+  }
+
+  /** Regions the selected kernel's dots are drawn for, closest to compute first. */
+  function selectedDotRegions() {
+    if (allRegionsActive()) {
+      return cacheKeys.slice().sort(function(a, b) {
+        return memDistanceRank(a) - memDistanceRank(b);
+      });
+    }
+    return [cacheKeys[effectiveRegionIndex()]];
   }
 
   function currentMode() {
@@ -1990,14 +2010,14 @@ __D3_SCRIPT__
   function updateRooflineWidths() {
     const r = currentMode().region;
     const filterOn = rooflineFilterActive();
-    // When a single kernel is selected its dots are drawn against every memory
+    // With "All regions" the selected kernel's dots are drawn against every memory
     // region, so thicken all rooflines (not just the AI-axis one) to match.
-    const singleKernelSelected = kernelFilterActive() && selectedKernelNames.size === 1;
+    const allRegions = allRegionsActive();
     roofGroup.selectAll(".roofline-path").each(function() {
       const idx = +d3.select(this).attr("data-idx");
       const key = cacheKeys[idx];
       const inSel = !filterOn || selectedRooflineKeys.has(key);
-      const baseW = (singleKernelSelected || idx === r) ? 3 : 1;
+      const baseW = (allRegions || idx === r) ? 3 : 1;
       const sel = d3.select(this);
       if (!inSel) {
         sel.attr("stroke-width", 1).attr("opacity", 0.18);
@@ -2016,7 +2036,7 @@ __D3_SCRIPT__
   function updateLegend() {
     const r = currentMode().region;
     const filterOn = rooflineFilterActive();
-    const singleKernelSelected = kernelFilterActive() && selectedKernelNames.size === 1;
+    const allRegions = allRegionsActive();
     legendG.selectAll("g.lrow").each(function(d, i) {
       const key = d;
       const inSel = !filterOn || selectedRooflineKeys.has(key);
@@ -2026,10 +2046,11 @@ __D3_SCRIPT__
         line.attr("stroke-width", 1).attr("opacity", 0.35);
         text.attr("opacity", 0.45);
       } else {
-        line.attr("opacity", 1).attr("stroke-width", (singleKernelSelected || i === r) ? 3 : 1);
+        line.attr("opacity", 1).attr("stroke-width", (allRegions || i === r) ? 3 : 1);
         text.attr("opacity", 1);
       }
-      text.text(d + (i === r ? " (AI axis)" : ""));
+      // Under "All regions" every dot sits at its own region's AI, so no single row owns the axis.
+      text.text(d + (!allRegions && i === r ? " (AI axis)" : ""));
     });
     let personalTitle = false;
     if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
@@ -2129,9 +2150,7 @@ __D3_SCRIPT__
     const expanded = [];
     // Closest-to-furthest order so further-away regions are appended last and
     // therefore drawn on top of closer ones when their dots overlap.
-    const orderedMemKeys = cacheKeys.slice().sort(function(a, b) {
-      return memDistanceRank(a) - memDistanceRank(b);
-    });
+    const orderedMemKeys = selectedDotRegions();
     src.forEach(function(d) {
       const c = d.cumulativePct;
       if (c == null || !Number.isFinite(c) || c > t) return;
