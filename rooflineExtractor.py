@@ -2657,7 +2657,6 @@ def extract(
         "Agent_Id",
         "Grid_Size",
         "KernelName",
-        "Queue_Id",
         "Workgroup_Size",
     ]
     if "Application" in df_roof.columns and "Application" in df_runtime.columns:
