@@ -398,6 +398,63 @@ def _load_peaks(df_bw, arch_col, df):
     return peaks
 
 
+def _compute_inst_mix_payload(row, peaks):
+    """Per-kernel instruction-mix breakdown for the interactive plot tooltip.
+
+    Mirrors the CLI "Instruction mix" computation: FLOPs per category, clamp
+    negatives to 0, normalize to percentages, drop empty categories, and sort
+    descending. Returns a list of {label, pct, peakTFlops} dicts (peakTFlops is
+    None when no empirical peak is available for that category).
+    """
+    inst_mix = [
+        ("FP16 Add",    64 * row['SQ_INSTS_VALU_ADD_F16'],     peaks.get('fp16_add')),
+        ("FP16 Mul",    64 * row['SQ_INSTS_VALU_MUL_F16'],     peaks.get('fp16_mul')),
+        ("FP16 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F16'], peaks.get('fp16_muladd')),
+        ("FP16 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F16'],   peaks.get('fp16_trans')),
+        ("FP32 Add",    64 * row['SQ_INSTS_VALU_ADD_F32'],     peaks.get('fp32_add')),
+        ("FP32 Mul",    64 * row['SQ_INSTS_VALU_MUL_F32'],     peaks.get('fp32_mul')),
+        ("FP32 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F32'], peaks.get('fp32_muladd')),
+        ("FP32 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F32'],   peaks.get('fp32_trans')),
+        ("FP64 Add",    64 * row['SQ_INSTS_VALU_ADD_F64'],     peaks.get('fp64_add')),
+        ("FP64 Mul",    64 * row['SQ_INSTS_VALU_MUL_F64'],     peaks.get('fp64_mul')),
+        ("FP64 MulAdd", 64 * 2 * row['SQ_INSTS_VALU_FMA_F64'], peaks.get('fp64_muladd')),
+        ("FP64 Trans",  64 * row['SQ_INSTS_VALU_TRANS_F64'],   peaks.get('fp64_trans')),
+        ("INT32",       row['TOTAL_VALU_I32'],                 peaks.get('int32')),
+        ("INT64",       row['TOTAL_VALU_I64'],                 peaks.get('int64')),
+        ("FP16 MFMA",   row['TOTAL_MOPS_F16'],                 peaks.get('fp16_mfma')),
+        ("BF16 MFMA",   row['TOTAL_MOPS_BF16'],                peaks.get('bf16_mfma')),
+        ("FP32 MFMA",   row['TOTAL_MOPS_F32'],                 peaks.get('fp32_mfma')),
+        ("FP64 MFMA",   row['TOTAL_MOPS_F64'],                 peaks.get('fp64_mfma')),
+        ("SALU",        row['TOTAL_SALU'],                     None),
+    ]
+    if 'TOTAL_MOPS_F8' in row.index:
+        inst_mix.append(("FP8 MFMA", row['TOTAL_MOPS_F8'], peaks.get('fp8_mfma')))
+    if 'TOTAL_MOPS_I8' in row.index:
+        inst_mix.append(("I8 MFMA", row['TOTAL_MOPS_I8'], peaks.get('i8_mfma')))
+    if 'TOTAL_MOPS_F6F4' in row.index:
+        inst_mix.append(("F6F4 MFMA", row['TOTAL_MOPS_F6F4'], peaks.get('f6f4_mfma')))
+    if 'TOTAL_VALU_OTHER' in row.index:
+        inst_mix.append(("Other VALU", row['TOTAL_VALU_OTHER'], peaks.get('other')))
+
+    inst_mix = [(label, max(0.0, float(ops)), peak) for label, ops, peak in inst_mix]
+    total_ops = sum(ops for _, ops, _ in inst_mix)
+    if total_ops <= 0:
+        return []
+
+    out = []
+    for label, ops, peak in inst_mix:
+        if ops <= 0:
+            continue
+        peak_tflops = None
+        if peak is not None and np.isfinite(peak) and float(peak) > 0:
+            peak_tflops = float(peak) / 1000.0
+        out.append(
+            {"label": label, "pct": ops / total_ops * 100.0, "peakTFlops": peak_tflops}
+        )
+    out.sort(key=lambda e: e["pct"], reverse=True)
+    return out
+
+
 def _compute_kernel_peak(df, peaks):
     """Compute kernel-specific compute peak from instruction counts and peak throughputs."""
     weighted_time = (
@@ -1080,6 +1137,19 @@ __D3_SCRIPT__
     border: 1px solid rgba(0,0,0,0.2);
   }
   .theme-dark .kernel-swatch { border-color: rgba(255,255,255,0.25); }
+  .kernel-swatch.avg-star-swatch {
+    border: none;
+    border-radius: 0;
+    background: none;
+    width: auto;
+    height: auto;
+    margin-top: 0;
+    color: #ffd60a;
+    font-size: 15px;
+    line-height: 1;
+    -webkit-text-stroke: 0.5px rgba(0,0,0,0.55);
+    text-shadow: 0 0 1px rgba(0,0,0,0.55);
+  }
   .kernel-name { flex: 1 1 auto; min-width: 0; }
   .kernel-pct { flex-shrink: 0; opacity: 0.85; white-space: nowrap; }
   .kernel-legend-header {
@@ -1215,8 +1285,9 @@ __D3_SCRIPT__
     position: fixed; pointer-events: none; z-index: 50;
     background: var(--tooltip-bg); color: var(--tooltip-fg);
     border: 1px solid var(--tooltip-border); border-radius: 4px;
-    padding: 8px 10px; font-size: 12px; line-height: 1.35; max-width: 420px;
-    white-space: pre-line; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    padding: 8px 10px; font-size: 12px; line-height: 1.35; max-width: 520px;
+    white-space: pre; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     display: none;
   }
 </style>
@@ -1230,6 +1301,7 @@ __D3_SCRIPT__
       <h3 id="plot-info-heading">Implementation Details and Disclaimers</h3>
       <ul>
         <li><b>Peak compute:</b> The peak compute is based on the instruction mix of each kernel. It is the weighted average of the measured throughput of each instruction counted in the kernel. Clicking on or hovering the mouse over a kernel dot will show that kernel's empirical peak compute. If none is selected, the default peak compute displayed is FP64 MFMA.</li>
+        <li><b>Application-average star:</b> The gold star marks the whole application's aggregate point: arithmetic intensity computed as total FLOPs / total bytes accessed and throughput as total FLOPs / total kernel time, across all dispatches. Its arithmetic intensity follows the currently selected memory region.</li>
         <li><b>Total FLOPs:</b> The "flops" value reported includes floating point AND integer operations. These operations all go through the same VALU pipe, so they should be counted together. </li>
         <li><b>Curved rooflines:</b> HBM and LDS rooflines are drawn with a curved shape. This is because workloads that are demanding in bandwidth AND compute consume more power, and subsequently get their clocks throttled. So, the roofline peak is lower in the "knee" region, where the bandwidth and compute lines meet. </li>
         <li><b>Packed instructions:</b> Any packed instructions are counted as 1 operation by the profiler. If your workload uses packed instructions, the flops value may be underreported. </li>
@@ -1270,7 +1342,7 @@ __D3_SCRIPT__
         <h2 class="kernel-legend-heading" id="kernel-legend-heading">Kernels</h2>
         <button type="button" class="kernel-legend-clear" id="kernel-legend-clear" hidden>Show all kernels</button>
       </div>
-      <p class="kernel-legend-help" id="kernel-legend-help">Click a row to show only that kernel; click again to show all. Ctrl+click (⌘+click on Mac) to add or remove kernels.</p>
+      <p class="kernel-legend-help" id="kernel-legend-help">Click a row (or the ★ application-average point) to show only it; click again to show all. Ctrl+click (⌘+click on Mac) to add or remove items from the selection.</p>
       <ul class="kernel-legend-list" id="kernel-legend-list" role="list"></ul>
     </aside>
   </div>
@@ -1296,6 +1368,32 @@ __D3_SCRIPT__
   function rooflineColorForKey(key) {
     const idx = cacheKeys.indexOf(key);
     return idx < 0 ? rooflinePalette[0] : rooflineColorForIndex(idx);
+  }
+  // Dot radius scales with kernel runtime so longer-running kernels appear as
+  // bigger dots. A sqrt scale is used so the dot *area* is proportional to
+  // runtime. Dispatch and aggregate views get independent domains because their
+  // runtime magnitudes differ (single dispatch vs. summed kernel runtime).
+  const DOT_RADIUS_RANGE = [3, 15];
+  const DOT_RADIUS_DEFAULT = 4;
+  function makeRuntimeRadiusScale(rows) {
+    const vals = (rows || [])
+      .map(function(d) { return d.runtimeNs; })
+      .filter(function(v) { return v != null && Number.isFinite(v) && v > 0; });
+    if (vals.length === 0) return function() { return DOT_RADIUS_DEFAULT; };
+    const lo = Math.min.apply(null, vals);
+    const hi = Math.max.apply(null, vals);
+    if (!(hi > lo)) return function() { return DOT_RADIUS_DEFAULT; };
+    const scale = d3.scaleSqrt().domain([lo, hi]).range(DOT_RADIUS_RANGE).clamp(true);
+    return function(v) {
+      if (v == null || !Number.isFinite(v) || !(v > 0)) return DOT_RADIUS_DEFAULT;
+      return scale(v);
+    };
+  }
+  const dispatchRadiusScale = makeRuntimeRadiusScale(data.dispatch);
+  const aggregateRadiusScale = makeRuntimeRadiusScale(data.aggregate);
+  function dotRadius(d) {
+    const scale = currentMode().aggregate ? aggregateRadiusScale : dispatchRadiusScale;
+    return scale(d.runtimeNs);
   }
   /** When false, HBM/LDS use linear min(AI×B, P) even if α model metadata is present. */
   let useCurvedHbmLdsRooflines = true;
@@ -1415,6 +1513,8 @@ __D3_SCRIPT__
     });
 
   const dotLayer = plotInner.append("g").attr("class", "dots");
+  // Drawn after dots so the application-average star sits on top of the dot cloud.
+  const starLayer = plotInner.append("g").attr("class", "avg-star");
 
   const gx = g.append("g").attr("class", "axis x-axis").attr("transform", "translate(0," + ih + ")");
   const gy = g.append("g").attr("class", "axis y-axis");
@@ -1443,6 +1543,12 @@ __D3_SCRIPT__
   const kClear = document.getElementById("kernel-legend-clear");
   const selectedKernelNames = new Set();
   const selectedRooflineKeys = new Set();
+  // The application-average star participates in the same filter model as kernels:
+  // it is shown by default, hidden when other kernels are isolated, and can itself
+  // be isolated (hiding all kernels). `avgStarSelected` mirrors membership in
+  // `selectedKernelNames` for the star.
+  let avgStarSelected = false;
+  let avgStarLegendRow = null;
   let roofHoverKernelName = null;
   /** When Individual (dispatches) view: instruction-mix ceiling for the hovered dispatch (not kernel aggregate). */
   let roofHoverDispatchComputePeak = null;
@@ -1450,7 +1556,7 @@ __D3_SCRIPT__
   let dotTooltipDatum = null;
 
   function kernelFilterActive() {
-    return selectedKernelNames.size > 0;
+    return selectedKernelNames.size > 0 || avgStarSelected;
   }
 
   function rooflineFilterActive() {
@@ -1715,10 +1821,12 @@ __D3_SCRIPT__
         ? "Kernels (" + shownCount + " / " + totalCount + ")"
         : "Kernels (" + totalCount + ")";
       if (kernelFilterActive()) {
-        t += " — " + selectedKernelNames.size + " selected";
+        const selCount = selectedKernelNames.size + (avgStarSelected ? 1 : 0);
+        t += " — " + selCount + " selected";
       }
       kHead.textContent = t;
     }
+    updateAvgStarLegendRow();
     if (kClear) kClear.hidden = !kernelFilterActive();
     if (kUl) {
       kUl.querySelectorAll("li").forEach(function(li) {
@@ -1748,6 +1856,7 @@ __D3_SCRIPT__
     if (event.ctrlKey || event.metaKey) {
       if (!kernelFilterActive()) {
         kLeg.forEach(function(k) { selectedKernelNames.add(k.name); });
+        avgStarSelected = true;
         selectedKernelNames.delete(name);
       } else if (selectedKernelNames.has(name)) {
         selectedKernelNames.delete(name);
@@ -1755,11 +1864,33 @@ __D3_SCRIPT__
         selectedKernelNames.add(name);
       }
     } else {
-      if (selectedKernelNames.size === 1 && selectedKernelNames.has(name)) {
+      if (selectedKernelNames.size === 1 && selectedKernelNames.has(name) && !avgStarSelected) {
         selectedKernelNames.clear();
       } else {
         selectedKernelNames.clear();
+        avgStarSelected = false;
         selectedKernelNames.add(name);
+      }
+    }
+    updateKernelLegendUI();
+    redraw();
+  }
+
+  // Star participates in the same isolate/toggle model as kernels.
+  function onAvgStarActivate(event) {
+    if (event && (event.ctrlKey || event.metaKey)) {
+      if (!kernelFilterActive()) {
+        kLeg.forEach(function(k) { selectedKernelNames.add(k.name); });
+        avgStarSelected = false;
+      } else {
+        avgStarSelected = !avgStarSelected;
+      }
+    } else {
+      if (avgStarSelected && selectedKernelNames.size === 0) {
+        avgStarSelected = false;
+      } else {
+        selectedKernelNames.clear();
+        avgStarSelected = true;
       }
     }
     updateKernelLegendUI();
@@ -1819,9 +1950,53 @@ __D3_SCRIPT__
     kUl.appendChild(li);
   });
 
+  function updateAvgStarLegendRow() {
+    if (!avgStarLegendRow) return;
+    const dimmed = kernelFilterActive() && !avgStarSelected;
+    avgStarLegendRow.classList.toggle("kernel-legend-selected", avgStarSelected);
+    avgStarLegendRow.classList.toggle("kernel-legend-dimmed", dimmed);
+    avgStarLegendRow.setAttribute("aria-pressed", dimmed ? "false" : "true");
+  }
+
+  // Application-average star: a filterable legend row that behaves like a kernel
+  // row (click to isolate the star, click again to show all, Ctrl/⌘+click to add
+  // or remove it from the selection). Prepended above the kernels so the app-level
+  // marker stays prominent. It carries no _kernelName, so updateKernelLegendUI()'s
+  // per-kernel loop skips it.
+  (function addAvgStarLegendRow() {
+    if (!kUl || !avgStarDataValid()) return;
+    const li = document.createElement("li");
+    li._avgStar = true;
+    li.className = "kernel-legend-avgstar";
+    li.setAttribute("role", "listitem");
+    li.setAttribute("aria-pressed", "true");
+    li.tabIndex = 0;
+    const sw = document.createElement("span");
+    sw.className = "kernel-swatch avg-star-swatch";
+    sw.textContent = "\u2605";
+    sw.setAttribute("aria-hidden", "true");
+    const lab = document.createElement("span");
+    lab.className = "kernel-name";
+    lab.textContent = "Full application (average of all kernels)";
+    lab.title = "Full application (average of all kernels)";
+    li.appendChild(sw);
+    li.appendChild(lab);
+    li.addEventListener("click", function(ev) { onAvgStarActivate(ev); });
+    li.addEventListener("keydown", function(ev) {
+      if (ev.key === "Enter" || ev.key === " ") {
+        ev.preventDefault();
+        onAvgStarActivate(ev);
+      }
+    });
+    kUl.insertBefore(li, kUl.firstChild);
+    avgStarLegendRow = li;
+    updateAvgStarLegendRow();
+  })();
+
   if (kClear) {
     kClear.addEventListener("click", function() {
       selectedKernelNames.clear();
+      avgStarSelected = false;
       updateKernelLegendUI();
       redraw();
     });
@@ -2081,6 +2256,56 @@ __D3_SCRIPT__
     return d.peak;
   }
 
+  function instMixLines(d) {
+    const mix = d.instMix;
+    if (!mix || !mix.length) return [];
+    const labelW = Math.max.apply(null, mix.map(function(e) { return e.label.length; }));
+    const peakNums = mix.map(function(e) {
+      return (e.peakTFlops != null && Number.isFinite(e.peakTFlops)) ? e.peakTFlops.toFixed(1) : null;
+    });
+    const peakNumW = Math.max.apply(null, peakNums.map(function(s) { return s ? s.length : 0; }));
+    const out = ["Instruction mix (roofline peak):"];
+    mix.forEach(function(e, i) {
+      const label = e.label.padEnd(labelW);
+      const pct = (e.pct.toFixed(1) + "%").padStart(6);
+      const peakStr = peakNums[i] != null
+        ? (peakNums[i].padStart(peakNumW) + " TFLOPs/s")
+        : "N/A";
+      out.push("  " + label + "  " + pct + "   " + peakStr);
+    });
+    return out;
+  }
+
+  // Mirror the CLI _format_throughput: show TFLOPs/s once we hit >= 1 TFLOPs/s.
+  function formatThroughput(gflops) {
+    if (gflops == null || !Number.isFinite(gflops)) return "N/A";
+    return Math.abs(gflops) >= 1000
+      ? (gflops / 1000).toFixed(3) + " TFLOPs/s"
+      : gflops.toFixed(3) + " GFLOPs/s";
+  }
+
+  // Mirror the CLI _format_bandwidth: show TB/s once we hit >= 1 TB/s.
+  function formatBandwidth(gbps) {
+    if (gbps == null || !Number.isFinite(gbps)) return "N/A";
+    return Math.abs(gbps) >= 1000
+      ? (gbps / 1000).toFixed(3) + " TB/s"
+      : gbps.toFixed(3) + " GB/s";
+  }
+
+  // Mirror the CLI _limiter_memory_level: memory level if the limiter is a
+  // bandwidth roof (e.g. "HBM_BW (gfx942)"), otherwise null.
+  const MEMORY_LIMITER_LEVELS = ["HBM", "L2", "vL1d", "LDS"];
+  function limiterMemoryLevel(limiterStr) {
+    if (typeof limiterStr !== "string" || !limiterStr) return null;
+    const tag = limiterStr.split(/\s+/)[0];
+    for (let i = 0; i < MEMORY_LIMITER_LEVELS.length; i++) {
+      if (tag.indexOf(MEMORY_LIMITER_LEVELS[i] + "_BW") === 0) {
+        return MEMORY_LIMITER_LEVELS[i];
+      }
+    }
+    return null;
+  }
+
   function tooltipHtml(d) {
     const key = d.memRegion || regionKey();
     const rawAi = d.ai[key];
@@ -2089,7 +2314,7 @@ __D3_SCRIPT__
     const m = currentMode();
     const nl = String.fromCharCode(10);
     const peakVal = tooltipPeakForDot(d);
-    const peakStr = Number.isFinite(peakVal) ? peakVal.toFixed(3) : "N/A";
+    const peakStr = formatThroughput(peakVal);
     // Recompute percent against the currently shown roof so curved/linear toggle is reflected.
     const pctRoof = (Number.isFinite(peakVal) && peakVal > 0
                      && d.throughput != null && Number.isFinite(d.throughput))
@@ -2099,27 +2324,46 @@ __D3_SCRIPT__
     const limiterStr = (alphaCharts && !useCurvedHbmLdsRooflines && d.limiterLinear)
       ? d.limiterLinear
       : d.limiter;
+    // For bandwidth-limited points, report the achieved bandwidth of the limiting
+    // region. Achieved BW (GB/s) = throughput (GFLOPs/s) / AI (FLOPs/byte).
+    const limiterLevel = limiterMemoryLevel(limiterStr);
+    let achievedBwLine = null;
+    if (limiterLevel) {
+      const aiForLimiter = d.ai[limiterLevel];
+      if (aiForLimiter != null && Number.isFinite(aiForLimiter) && aiForLimiter > 0
+          && d.throughput != null && Number.isFinite(d.throughput)) {
+        achievedBwLine = "Achieved " + limiterLevel + " bandwidth: "
+          + formatBandwidth(d.throughput / aiForLimiter);
+      }
+    }
+    const bwLines = achievedBwLine ? [achievedBwLine] : [];
     const lines = m.aggregate ? [
       "Name: " + d.nameDisplay,
       aiLabel + aiVal,
-      "Achieved throughput: " + d.throughput.toFixed(3) + " GFLOPs/s",
-      "Peak throughput: " + peakStr + " GFLOPs/s",
+      "Achieved throughput: " + formatThroughput(d.throughput),
+      "Peak throughput: " + peakStr,
       "Percent of roofline achieved: " + pctRoof,
       "Performance limiter: " + limiterStr,
+    ].concat(bwLines, [
       "Total dispatches: " + d.count,
       "Aggregate percent runtime: " + d.percentage.toFixed(5) + " %"
-    ] : [
+    ]) : [
       "Name: " + d.nameDisplay,
       "Index: " + d.index + " / " + d.totalKernels,
       aiLabel + aiVal,
-      "Achieved throughput: " + d.throughput.toFixed(3) + " GFLOPs/s",
-      "Peak throughput: " + peakStr + " GFLOPs/s",
+      "Achieved throughput: " + formatThroughput(d.throughput),
+      "Peak throughput: " + peakStr,
       "Percent of roofline achieved: " + pctRoof,
       "Performance limiter: " + limiterStr,
+    ].concat(bwLines, [
       "Aggregate percent runtime: " + d.percentageAggregate.toFixed(5) + " %",
       "Individual percent runtime: " + d.percentage.toFixed(5) + " %"
-    ];
-    return lines.join(nl);
+    ]);
+    const mixLines = instMixLines(d);
+    if (mixLines.length) {
+      lines.push("");
+    }
+    return lines.concat(mixLines).join(nl);
   }
 
   function refreshDotTooltipIfNeeded() {
@@ -2176,9 +2420,9 @@ __D3_SCRIPT__
     const sel = dotLayer.selectAll("circle.dot").data(pts, d => d.id);
     sel.enter().append("circle")
       .attr("class", "dot")
-      .attr("r", 4)
       .style("cursor", "pointer")
       .merge(sel)
+      .attr("r", d => dotRadius(d))
       .attr("cx", d => xFn(d.ai[d.memRegion || key]))
       .attr("cy", d => yFn(d.throughput))
       .attr("fill", d => d.dotColor || d.color)
@@ -2217,6 +2461,71 @@ __D3_SCRIPT__
     sel.exit().remove();
   }
 
+  function avgStarTooltip(d) {
+    const nl = String.fromCharCode(10);
+    const key = regionKey();
+    const aiVal = d.ai[key];
+    return [
+      "Full application (average of all kernels)",
+      "AI (" + key + "): " + (aiVal != null && Number.isFinite(aiVal) ? aiVal : "N/A"),
+      "Achieved throughput: " + formatThroughput(d.throughput)
+    ].join(nl);
+  }
+
+  const avgStarSymbol = d3.symbol().type(d3.symbolStar).size(100);
+
+  // The application-average point has valid data to plot if its throughput and at
+  // least one region's arithmetic intensity are finite and positive.
+  function avgStarDataValid() {
+    const avg = data.average;
+    if (!avg || avg.throughput == null || !Number.isFinite(avg.throughput) || avg.throughput <= 0) {
+      return false;
+    }
+    if (!avg.ai) return false;
+    return cacheKeys.some(function(k) {
+      const v = avg.ai[k];
+      return v != null && Number.isFinite(v) && v > 0;
+    });
+  }
+
+  function drawAverageStar(xFn, yFn) {
+    const avg = data.average;
+    const key = regionKey();
+    const aiVal = avg && avg.ai ? avg.ai[key] : null;
+    // Shown by default; hidden when other kernels are isolated (and the star is not
+    // part of that selection), matching the kernel filter behavior.
+    const show = !kernelFilterActive() || avgStarSelected;
+    const valid = show && avg
+      && avg.throughput != null && Number.isFinite(avg.throughput) && avg.throughput > 0
+      && aiVal != null && Number.isFinite(aiVal) && aiVal > 0;
+    const starData = valid ? [avg] : [];
+    const sel = starLayer.selectAll("path.avg-star-mark").data(starData);
+    sel.enter().append("path")
+      .attr("class", "avg-star-mark")
+      .attr("d", avgStarSymbol)
+      .attr("fill", "#ffd60a")
+      .attr("stroke", "#000")
+      .attr("stroke-width", 1.25)
+      .style("cursor", "pointer")
+      .on("click", function(event) {
+        event.stopPropagation();
+        tooltip.style("display", "none");
+        onAvgStarActivate(event);
+      })
+      .on("mouseenter", function(event, d) {
+        tooltip.style("display", "block").text(avgStarTooltip(d));
+      })
+      .on("mousemove", function(event) {
+        tooltip.style("left", (event.clientX + 14) + "px").style("top", (event.clientY + 14) + "px");
+      })
+      .on("mouseleave", function() {
+        tooltip.style("display", "none");
+      })
+      .merge(sel)
+      .attr("transform", d => "translate(" + xFn(d.ai[key]) + "," + yFn(d.throughput) + ")");
+    sel.exit().remove();
+  }
+
   function updateThresholdLabel() {
     thLabel.textContent = th[thresholdIndex].toFixed(3) + "%";
   }
@@ -2239,6 +2548,7 @@ __D3_SCRIPT__
 
     updateRooflineWidths();
     drawDots(x, y);
+    drawAverageStar(x, y);
     updateLegend();
     updateThresholdLabel();
     refreshDotTooltipIfNeeded();
@@ -2255,6 +2565,7 @@ __D3_SCRIPT__
     const m = currentMode();
     disc.style.display = (!m.aggregate && meta.disclaimer) ? "block" : "none";
     drawDots(x, y);
+    drawAverageStar(x, y);
     updateLegend();
     updateKernelLegendUI();
     updateThresholdLabel();
@@ -2402,6 +2713,30 @@ __D3_SCRIPT__
 
       let y = pad;
 
+      if (avgStarDataValid()) {
+        const starDimmed = kernelFilterActive() && !avgStarSelected;
+        const starOpacity = starDimmed ? "0.45" : "1";
+        const starEl = document.createElementNS(SVG_NS, "text");
+        starEl.setAttribute("x", String(pad));
+        starEl.setAttribute("y", String(y + baseline + 1));
+        starEl.setAttribute("font-size", "15");
+        starEl.setAttribute("fill", "#ffd60a");
+        starEl.setAttribute("stroke", "#000");
+        starEl.setAttribute("stroke-width", "0.5");
+        starEl.setAttribute("opacity", starOpacity);
+        starEl.textContent = "\u2605";
+        panel.appendChild(starEl);
+        const starLab = document.createElementNS(SVG_NS, "text");
+        starLab.setAttribute("x", String(labelX));
+        starLab.setAttribute("y", String(y + baseline));
+        starLab.setAttribute("font-size", "11");
+        starLab.setAttribute("fill", fg);
+        starLab.setAttribute("opacity", starOpacity);
+        starLab.textContent = "Full application (average of all kernels)";
+        panel.appendChild(starLab);
+        y += rowH + 6;
+      }
+
       const kHeadEl = document.createElementNS(SVG_NS, "text");
       kHeadEl.setAttribute("x", String(pad));
       kHeadEl.setAttribute("y", String(y + 14));
@@ -2412,7 +2747,8 @@ __D3_SCRIPT__
         ? "Kernels (" + kernelRows.length + " / " + kLeg.length + ")"
         : "Kernels (" + kLeg.length + ")";
       if (kFilterActive) {
-        kHeadText += " \u2014 " + selectedKernelNames.size + " selected";
+        const selCount = selectedKernelNames.size + (avgStarSelected ? 1 : 0);
+        kHeadText += " \u2014 " + selCount + " selected";
       }
       kHeadEl.textContent = kHeadText;
       panel.appendChild(kHeadEl);
@@ -3083,6 +3419,7 @@ def extract(
                     "percentAchieved": _json_safe_float(row["PercentAchieved"]),
                     "percentage": _json_safe_float(row["Percentage"]),
                     "percentageAggregate": _json_safe_float(row["PercentageAggregate"]),
+                    "runtimeNs": _json_safe_float(row["DurationNs"]),
                     "cumulativePct": _json_safe_float(row["CumulativePercentageAbove"]),
                     "index": int(row["Index"]) if pd.notna(row["Index"]) else 0,
                     "totalKernels": int(row["TotalKernels"]),
@@ -3092,6 +3429,7 @@ def extract(
                     "limiter": str(row["LIMITER"]),
                     "limiterLinear": str(row["LIMITER_LINEAR"]) if "LIMITER_LINEAR" in row.index else None,
                     "color": str(row["color"]),
+                    "instMix": _compute_inst_mix_payload(row, _peaks_agg),
                 }
             )
 
@@ -3112,12 +3450,14 @@ def extract(
                     "percentAchieved": _json_safe_float(kernel["PercentAchieved"]),
                     "percentage": _json_safe_float(kernel["Percentage"]),
                     "cumulativePct": _json_safe_float(kernel["CumulativePercentageAbove"]),
+                    "runtimeNs": _json_safe_float(kernel["RuntimeNs"]),
                     "peak": _json_safe_float(kernel["PEAK"]),
                     "peakLinear": _json_safe_float(kernel.get("PEAK_LINEAR")),
                     "limiter": str(kernel["LIMITER"]),
                     "limiterLinear": str(kernel["LIMITER_LINEAR"]) if "LIMITER_LINEAR" in kernel.index else "",
                     "count": int(kernel["Count"]),
                     "color": str(kernel["color"]),
+                    "instMix": _compute_inst_mix_payload(kernel, _peaks_agg),
                 }
             )
 
@@ -3167,6 +3507,29 @@ def extract(
 
         _def_lds_alpha = _default_lds_alpha_fp64_mfma(arch) if use_lds_alpha else None
 
+        # Application-average point: aggregate arithmetic intensity and throughput
+        # across every dispatch (total FLOPs / total bytes, total FLOPs / total time).
+        _avg_total_ops = float(df_roof["TOTAL_OPS"].sum())
+        _avg_total_ns = float(df_roof["DurationNs"].sum())
+
+        def _avg_ai(_bw_col):
+            _b = float(df_roof[_bw_col].sum())
+            return _avg_total_ops / _b if _b > 0 else None
+
+        average_payload = {
+            "kernelName": "Full application (average of all kernels)",
+            "nameDisplay": "Full application (average of all kernels)",
+            "ai": {
+                "HBM": _json_safe_float(_avg_ai("BW_HBM")),
+                "L2": _json_safe_float(_avg_ai("BW_L2")),
+                "vL1d": _json_safe_float(_avg_ai("BW_vL1d")),
+                "LDS": _json_safe_float(_avg_ai("BW_LDS")),
+            },
+            "throughput": _json_safe_float(
+                _avg_total_ops / _avg_total_ns if _avg_total_ns > 0 else None
+            ),
+        }
+
         payload = {
             "meta": {
                 "title": f"Roofline Plot ({arch}) for kernels in {roofCountFilename}",
@@ -3194,6 +3557,7 @@ def extract(
             },
             "rooflines": rooflines_payload,
             "thresholds": [float(t) for t in thresholds],
+            "average": average_payload,
             "dispatch": dispatch,
             "aggregate": aggregate,
             "kernelLegend": kernel_legend,
