@@ -3520,10 +3520,10 @@ def extract(
             "kernelName": "Full application (average of all kernels)",
             "nameDisplay": "Full application (average of all kernels)",
             "ai": {
-                "HBM": _json_safe_float(_avg_ai("BW_HBM")),
-                "L2": _json_safe_float(_avg_ai("BW_L2")),
-                "vL1d": _json_safe_float(_avg_ai("BW_vL1d")),
-                "LDS": _json_safe_float(_avg_ai("BW_LDS")),
+                "HBM": _json_safe_float(_avg_ai("BYTES_HBM")),
+                "L2": _json_safe_float(_avg_ai("BYTES_L2")),
+                "vL1d": _json_safe_float(_avg_ai("BYTES_vL1d")),
+                "LDS": _json_safe_float(_avg_ai("BYTES_LDS")),
             },
             "throughput": _json_safe_float(
                 _avg_total_ops / _avg_total_ns if _avg_total_ns > 0 else None
