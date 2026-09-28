@@ -2297,7 +2297,7 @@ __D3_SCRIPT__
   const MEMORY_LIMITER_LEVELS = ["HBM", "L2", "vL1d", "LDS"];
   function limiterMemoryLevel(limiterStr) {
     if (typeof limiterStr !== "string" || !limiterStr) return null;
-    const tag = limiterStr.split(/\s+/)[0];
+    const tag = limiterStr.split(/\\s+/)[0];
     for (let i = 0; i < MEMORY_LIMITER_LEVELS.length; i++) {
       if (tag.indexOf(MEMORY_LIMITER_LEVELS[i] + "_BW") === 0) {
         return MEMORY_LIMITER_LEVELS[i];
@@ -3109,8 +3109,11 @@ def extract(
 
     df.set_index('KernelName', inplace=True)
 
-    # Prepare for analysis
-    df = df.sort_values(by='Percentage', ascending=False)
+    # Prepare for analysis. sort_values keeps the block layout built up by the
+    # column-by-column updates above; copy() consolidates it so the derived
+    # columns below are not inserted into a fragmented frame (pandas 3 warns
+    # once a frame has more than 100 blocks).
+    df = df.sort_values(by='Percentage', ascending=False).copy()
     df_peaks = df[['HBM_BW_PEAK','L2_BW_PEAK','vL1d_BW_PEAK','LDS_BW_PEAK','KERNEL_COMPUTE_PEAK']]
     df['PEAK'] = df_peaks.where(df_peaks > 0).min(axis=1)
 
@@ -3306,10 +3309,24 @@ def extract(
         )
     print()
 
-    df_roof['Percentage'] = df_roof['DurationNs']/sum(totalRuntimes) * 100
-    df_roof['Throughput'] = df_roof['TOTAL_OPS'] / df_roof['DurationNs']
-    df_roof['PercentAchieved'] = _percent_roof_achieved(df_roof['Throughput'], df_roof['PEAK'])
-    df_roof['PercentAchieved_LINEAR'] = _percent_roof_achieved(df_roof['Throughput'], df_roof['PEAK_LINEAR'])
+
+    _throughput = df_roof['TOTAL_OPS'] / df_roof['DurationNs']
+    df_roof = pd.concat(
+        [
+            df_roof,
+            pd.DataFrame(
+                {
+                    'Percentage': df_roof['DurationNs'] / sum(totalRuntimes) * 100,
+                    'Throughput': _throughput,
+                    'PercentAchieved': _percent_roof_achieved(_throughput, df_roof['PEAK']),
+                    'PercentAchieved_LINEAR': _percent_roof_achieved(_throughput, df_roof['PEAK_LINEAR']),
+                },
+                index=df_roof.index,
+            ),
+        ],
+        axis=1,
+    )
+
     df_roof = df_roof.rename(columns={'KernelName_x':'KernelName'}).merge(df['Percentage'],on='KernelName')
     df_roof = df_roof.rename(columns={'Percentage_x':'Percentage'})
     df_roof = df_roof.rename(columns={'Percentage_y':'PercentageAggregate'})
