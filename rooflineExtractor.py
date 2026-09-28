@@ -3392,7 +3392,10 @@ def extract(
         cumulative_percentage_by_value = (
             percentage_desc.groupby(percentage_desc, sort=False).sum().cumsum()
         )
-        df["CumulativePercentageAbove"] = df["Percentage"].map(cumulative_percentage_by_value)
+        # Clip so float round-off in the cumsum can't push the last kernel above the 100% slider stop.
+        df["CumulativePercentageAbove"] = (
+            df["Percentage"].map(cumulative_percentage_by_value).clip(upper=100.0)
+        )
         df_plot = df_plot.merge(df["CumulativePercentageAbove"], on="KernelName")
 
         x_min = 0.001
@@ -3478,9 +3481,8 @@ def extract(
                 }
             )
 
-        thresholds = df["CumulativePercentageAbove"].tolist()
-        thresholds.sort(reverse=True)
-        thresholds = [100] + thresholds[-40:]
+        thresholds = sorted(set(df["CumulativePercentageAbove"].dropna().tolist()), reverse=True)
+        thresholds = [100.0] + [t for t in thresholds[-40:] if t < 100.0]
 
         disclaimer_text = ""
         if total_dispatches_orig > len(df_plot):
