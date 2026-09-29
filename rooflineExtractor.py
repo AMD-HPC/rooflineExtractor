@@ -985,17 +985,6 @@ def compute_flops(df, arch):
     return df
 
 
-def _wrap_kernel_name_tooltip(name, width=50, max_lines=3):
-    """Wrap long kernel names for tooltip display (newline-separated)."""
-    if not name:
-        return ""
-    max_chars = width * max_lines
-    if len(name) <= max_chars:
-        return "\n".join(name[i : i + width] for i in range(0, len(name), width))
-    truncated = name[: max_chars - 3] + "..."
-    return "\n".join(truncated[i : i + width] for i in range(0, len(truncated), width))
-
-
 def _json_safe_float(x):
     """Finite float for JSON, or None. Browsers' JSON.parse rejects Infinity/NaN (Python json emits them by default)."""
     try:
@@ -1265,7 +1254,8 @@ __D3_SCRIPT__
   }
   .info-popover li { margin: 3px 0; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; margin-bottom: 12px; }
-  .toolbar label { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
+  .toolbar label, .toolbar .toolbar-field { display: flex; flex-direction: column; gap: 4px; font-size: 0.85rem; }
+  .toolbar .toolbar-field[hidden] { display: none; }
   .toolbar select, .toolbar button { font-size: 0.9rem; padding: 4px 8px; }
   #chart-wrap svg { display: block; }
   .roofline-path { fill: none; stroke-linejoin: round; pointer-events: none; }
@@ -1285,7 +1275,7 @@ __D3_SCRIPT__
     position: fixed; pointer-events: none; z-index: 50;
     background: var(--tooltip-bg); color: var(--tooltip-fg);
     border: 1px solid var(--tooltip-border); border-radius: 4px;
-    padding: 8px 10px; font-size: 12px; line-height: 1.35; max-width: 520px;
+    padding: 8px 10px; font-size: 12px; line-height: 1.35;
     white-space: pre; box-shadow: 0 2px 8px rgba(0,0,0,0.15);
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
     display: none;
@@ -1312,24 +1302,23 @@ __D3_SCRIPT__
     </div>
   </div>
   <div class="toolbar">
-    <label>Memory region
+    <label>Memory Region
       <select id="memory-region-select" aria-label="Memory hierarchy for arithmetic intensity"></select>
     </label>
-    <label>View
-      <select id="view-type-select" aria-label="Aggregate or per-dispatch kernels">
-        <option value="aggregate" selected>Aggregate</option>
-        <option value="individual">Individual (dispatches)</option>
-      </select>
-    </label>
+    <div class="toolbar-field">View
+      <button type="button" id="btn-view-toggle" title="Plot each kernel dispatch as its own point">Show Individual Dispatches</button>
+    </div>
+    <div class="toolbar-field" id="hbm-lds-roofline-toggle-field" hidden>Roofline Shape
+      <button type="button" id="btn-hbm-lds-roofline-toggle" aria-pressed="true" title="Use piecewise-linear roofs for HBM and LDS">Toggle Curved Rooflines</button>
+    </div>
     <label>Total percent runtime displayed
       <input type="range" id="threshold-slider" min="0" max="0" value="0" step="1"/>
       <span id="threshold-label"></span>
     </label>
     <label>&nbsp;
       <span style="display:flex; gap:8px; flex-wrap:wrap;">
-        <button type="button" id="btn-theme-toggle" aria-pressed="true" title="Switch to light theme">Light mode</button>
-        <button type="button" id="btn-hbm-lds-roofline-toggle" hidden aria-pressed="true" title="Use piecewise-linear roofs for HBM and LDS">Linear HBM/LDS</button>
-        <button type="button" id="btn-reset-zoom" title="Reset axes to default range">Reset zoom</button>
+        <button type="button" id="btn-reset-zoom" title="Reset axes to default range">Reset Zoom</button>
+        <button type="button" id="btn-theme-toggle" aria-pressed="true" title="Switch to light theme">Light Mode</button>
         <button type="button" id="btn-export-png" title="Download the current plot as a PNG image">Export PNG</button>
       </span>
     </label>
@@ -1427,6 +1416,21 @@ __D3_SCRIPT__
 
   const tooltip = d3.select("body").append("div").attr("id", "tooltip");
 
+  // Offset from the cursor, flipping to the other side when it would overflow the viewport.
+  function moveTooltip(event) {
+    const node = tooltip.node();
+    const pad = 14;
+    let left = event.clientX + pad;
+    let top = event.clientY + pad;
+    if (left + node.offsetWidth > window.innerWidth) {
+      left = Math.max(0, event.clientX - pad - node.offsetWidth);
+    }
+    if (top + node.offsetHeight > window.innerHeight) {
+      top = Math.max(0, event.clientY - pad - node.offsetHeight);
+    }
+    tooltip.style("left", left + "px").style("top", top + "px");
+  }
+
   function rooflineTooltipHtml(cacheKey) {
     const nl = String.fromCharCode(10);
     const hbmAlphaOn = useCurvedHbmLdsRooflines && meta.useHbmAlphaModel === true && cacheKey === "HBM" && hbmAlphaForRoofline() != null;
@@ -1500,7 +1504,7 @@ __D3_SCRIPT__
       tooltip.style("display", "block").text(rooflineTooltipHtml(key));
     })
     .on("mousemove", function(event) {
-      tooltip.style("left", (event.clientX + 14) + "px").style("top", (event.clientY + 14) + "px");
+      moveTooltip(event);
     })
     .on("mouseleave", function() {
       tooltip.style("display", "none");
@@ -2027,8 +2031,14 @@ __D3_SCRIPT__
   let lastRegionIndex = 0;
   let allRegionsOptionEl = null;
 
-  const viewSel = document.getElementById("view-type-select");
-  viewSel.value = "aggregate";
+  const viewBtn = document.getElementById("btn-view-toggle");
+  let aggregateView = true;
+  function syncViewToggle() {
+    viewBtn.textContent = aggregateView ? "Show Individual Dispatches" : "Show Aggregated Kernels";
+    viewBtn.title = aggregateView
+      ? "Plot each kernel dispatch as its own point"
+      : "Plot one point per kernel, aggregated over its dispatches";
+  }
 
   function effectiveRegionIndex() {
     if (memSel.value === "all") return lastRegionIndex;
@@ -2076,7 +2086,7 @@ __D3_SCRIPT__
 
   function currentMode() {
     const r = effectiveRegionIndex();
-    const agg = viewSel.value === "aggregate";
+    const agg = aggregateView;
     return {
       region: r,
       aggregate: agg,
@@ -2099,7 +2109,7 @@ __D3_SCRIPT__
   function syncThemeToggle() {
     const btn = document.getElementById("btn-theme-toggle");
     const dark = isDarkTheme();
-    btn.textContent = dark ? "Light mode" : "Dark mode";
+    btn.textContent = dark ? "Light Mode" : "Dark Mode";
     btn.setAttribute("aria-pressed", String(dark));
     btn.title = dark ? "Switch to light theme" : "Switch to dark theme";
   }
@@ -2146,10 +2156,10 @@ __D3_SCRIPT__
     }
     function syncHbmLdsRooflineToggle() {
       const on = hbmLdsAlphaModelsActive();
-      btn.hidden = !on;
+      document.getElementById("hbm-lds-roofline-toggle-field").hidden = !on;
       if (!on) return;
       btn.setAttribute("aria-pressed", String(useCurvedHbmLdsRooflines));
-      btn.textContent = "Toggle curved rooflines";
+      btn.textContent = "Toggle Curved Rooflines";
       btn.title = useCurvedHbmLdsRooflines
         ? "Use piecewise-linear roofs (min(AI×bandwidth, compute)) for HBM and LDS"
         : "Use α-blended curved roofs for HBM and LDS";
@@ -2256,24 +2266,58 @@ __D3_SCRIPT__
     return d.peak;
   }
 
-  function instMixLines(d) {
+  // Mirror the CLI "Instruction mix" block.
+  function instMixRows(d) {
     const mix = d.instMix;
     if (!mix || !mix.length) return [];
-    const labelW = Math.max.apply(null, mix.map(function(e) { return e.label.length; }));
-    const peakNums = mix.map(function(e) {
-      return (e.peakTFlops != null && Number.isFinite(e.peakTFlops)) ? e.peakTFlops.toFixed(1) : null;
-    });
-    const peakNumW = Math.max.apply(null, peakNums.map(function(s) { return s ? s.length : 0; }));
-    const out = ["Instruction mix (roofline peak):"];
-    mix.forEach(function(e, i) {
-      const label = e.label.padEnd(labelW);
-      const pct = (e.pct.toFixed(1) + "%").padStart(6);
-      const peakStr = peakNums[i] != null
-        ? (peakNums[i].padStart(peakNumW) + " TFLOPs/s")
+    const rows = [];
+    let otherValu = false;
+    mix.forEach(function(e) {
+      let label = e.label;
+      if (label === "Other VALU") {
+        label += "*";
+        otherValu = true;
+      }
+      const peakStr = (e.peakTFlops != null && Number.isFinite(e.peakTFlops))
+        ? e.peakTFlops.toFixed(1) + " TFLOPs/s"
         : "N/A";
-      out.push("  " + label + "  " + pct + "   " + peakStr);
+      rows.push(["  " + (label + ":").padEnd(20) + " " + e.pct.toFixed(1).padStart(5) + "%   ", "(" + peakStr + ")"]);
     });
+    // Preformatted rather than a [label, value] row so the header lines up with the peak column.
+    const out = ["Instruction mix:".padEnd(rows[0][0].length) + "(roofline peak)"];
+    rows.forEach(function(r) { out.push(r[0] + r[1]); });
+    if (otherValu) {
+      out.push('  * "Other VALU" refers to instructions not covered by the other categories.');
+      out.push("    We use the peak throughput value of v_lshlrev_b32_e32 here.");
+    }
     return out;
+  }
+
+  // Hard-wrap text into chunks of `width` chars, truncating with "..." beyond maxLines.
+  function wrapText(s, width, maxLines) {
+    const maxChars = width * maxLines;
+    if (s.length > maxChars) s = s.slice(0, maxChars - 3) + "...";
+    const out = [];
+    for (let i = 0; i < s.length; i += width) out.push(s.slice(i, i + width));
+    return out;
+  }
+
+  // Lay out a tooltip like a CLI kernel block: header (wrapped to the width of
+  // the body), then sections, each preceded by a blank line. Rows are
+  // [label, value] pairs (labels padded to a common width) or preformatted strings.
+  function layoutTooltip(header, sections) {
+    const rows = [].concat.apply([], sections).filter(Array.isArray);
+    const w = Math.max.apply(null, [0].concat(rows.map(function(r) { return r[0].length; })));
+    const body = [];
+    sections.forEach(function(sec) {
+      if (!sec.length) return;
+      body.push("");
+      sec.forEach(function(r) {
+        body.push(Array.isArray(r) ? r[0].padEnd(w) + " " + r[1] : r);
+      });
+    });
+    const bodyW = Math.max.apply(null, [40].concat(body.map(function(l) { return l.length; })));
+    return wrapText(header, bodyW, 3).concat(body).join(String.fromCharCode(10));
   }
 
   // Mirror the CLI _format_throughput: show TFLOPs/s once we hit >= 1 TFLOPs/s.
@@ -2292,6 +2336,66 @@ __D3_SCRIPT__
       : gbps.toFixed(3) + " GB/s";
   }
 
+  // Python-style "{:.Ne}": JS drops the leading zero of single-digit exponents.
+  function formatExp(n, digits) {
+    const parts = n.toExponential(digits).split("e");
+    const exp = parts[1].slice(1);
+    return parts[0] + "e" + parts[1].charAt(0) + (exp.length < 2 ? "0" + exp : exp);
+  }
+
+  function formatFlopCount(n) {
+    if (n == null || !Number.isFinite(n)) return "N/A";
+    return formatExp(n, 3) + " FLOPs";
+  }
+
+  // Mirror the CLI _format_ai (4 decimals); "N/A" when no bytes were moved.
+  function formatAi(ai, bytes) {
+    if (ai == null || !Number.isFinite(ai) || bytes === 0) return "N/A";
+    return Number(ai.toFixed(4)) + " FLOPs/B";
+  }
+
+  function formatPct(p) {
+    if (p == null || !Number.isFinite(p)) return "N/A";
+    return (p !== 0 && Math.abs(p) < 0.001 ? formatExp(p, 2) : p.toFixed(3)) + " %";
+  }
+
+  // Mirror the CLI _format_byte_size: 1024-based B/KB/MB/GB/TB.
+  function formatByteSize(n) {
+    if (n == null || !Number.isFinite(n)) return "N/A";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let v = Math.abs(n);
+    let u = 0;
+    while (v >= 1024 && u < units.length - 1) {
+      v /= 1024;
+      u += 1;
+    }
+    if (n < 0) v = -v;
+    if (u === 0 && Number.isInteger(v)) return v + " B";
+    return v.toFixed(3) + " " + units[u];
+  }
+
+  // Mirror the CLI runtime lines: "{:.3e} ns ({:.3f} s)" / "({:.3f} ms)".
+  function formatRuntime(ns, unit) {
+    if (ns == null || !Number.isFinite(ns)) return "N/A";
+    const scale = unit === "s" ? 1e9 : 1e6;
+    return formatExp(ns, 3) + " ns (" + (ns / scale).toFixed(3) + " " + unit + ")";
+  }
+
+  // CLI "Total operations" / "Total bytes moved" / "Arithmetic intensity" rows for one memory region.
+  function countSections(d, allDispatches, region) {
+    const b = d.bytes || {};
+    const ai = d.ai || {};
+    const opsLabel = allDispatches ? "Total operations (all dispatches):" : "Total operations:";
+    const bytesLabel = allDispatches
+      ? "Total bytes moved (" + region + ", all dispatches):"
+      : "Total bytes moved (" + region + "):";
+    return [[
+      [opsLabel, formatFlopCount(d.totalOps)],
+      [bytesLabel, formatByteSize(b[region])],
+      ["Arithmetic intensity (" + region + "):", formatAi(ai[region], b[region])],
+    ]];
+  }
+
   // Mirror the CLI _limiter_memory_level: memory level if the limiter is a
   // bandwidth roof (e.g. "HBM_BW (gfx942)"), otherwise null.
   const MEMORY_LIMITER_LEVELS = ["HBM", "L2", "vL1d", "LDS"];
@@ -2307,63 +2411,52 @@ __D3_SCRIPT__
   }
 
   function tooltipHtml(d) {
-    const key = d.memRegion || regionKey();
-    const rawAi = d.ai[key];
-    const aiVal = rawAi != null && Number.isFinite(rawAi) ? rawAi : "N/A";
-    const aiLabel = d.memRegion ? ("AI (" + d.memRegion + "): ") : "AI: ";
     const m = currentMode();
-    const nl = String.fromCharCode(10);
     const peakVal = tooltipPeakForDot(d);
-    const peakStr = formatThroughput(peakVal);
     // Recompute percent against the currently shown roof so curved/linear toggle is reflected.
     const pctRoof = (Number.isFinite(peakVal) && peakVal > 0
                      && d.throughput != null && Number.isFinite(d.throughput))
       ? (d.throughput / peakVal * 100).toFixed(4) + " %"
       : "N/A";
     const alphaCharts = meta.useHbmAlphaModel === true || meta.useLdsAlphaModel === true;
-    const limiterStr = (alphaCharts && !useCurvedHbmLdsRooflines && d.limiterLinear)
-      ? d.limiterLinear
-      : d.limiter;
-    // For bandwidth-limited points, report the achieved bandwidth of the limiting
-    // region. Achieved BW (GB/s) = throughput (GFLOPs/s) / AI (FLOPs/byte).
-    const limiterLevel = limiterMemoryLevel(limiterStr);
-    let achievedBwLine = null;
-    if (limiterLevel) {
-      const aiForLimiter = d.ai[limiterLevel];
-      if (aiForLimiter != null && Number.isFinite(aiForLimiter) && aiForLimiter > 0
-          && d.throughput != null && Number.isFinite(d.throughput)) {
-        achievedBwLine = "Achieved " + limiterLevel + " bandwidth: "
-          + formatBandwidth(d.throughput / aiForLimiter);
-      }
+    const showLinear = alphaCharts && !useCurvedHbmLdsRooflines;
+    const roofLabel = alphaCharts && useCurvedHbmLdsRooflines ? "Curved" : "Linear";
+    const limiterStr = (showLinear && d.limiterLinear) ? d.limiterLinear : d.limiter;
+
+    // Only the selected memory region's bandwidth is reported; the roof's peak bandwidth
+    // only when that region is the limiter. BW (GB/s) = throughput (GFLOPs/s) / AI (FLOPs/byte).
+    const region = d.memRegion || regionKey();
+    const aiRegion = d.ai[region];
+    const bwValid = aiRegion != null && Number.isFinite(aiRegion) && aiRegion > 0;
+    const achievedRows = [["Achieved throughput:", formatThroughput(d.throughput)]];
+    if (bwValid && d.throughput != null && Number.isFinite(d.throughput)) {
+      achievedRows.push(["Achieved " + region + " bandwidth:", formatBandwidth(d.throughput / aiRegion)]);
     }
-    const bwLines = achievedBwLine ? [achievedBwLine] : [];
-    const lines = m.aggregate ? [
-      "Name: " + d.nameDisplay,
-      aiLabel + aiVal,
-      "Achieved throughput: " + formatThroughput(d.throughput),
-      "Peak throughput: " + peakStr,
-      "Percent of roofline achieved: " + pctRoof,
-      "Performance limiter: " + limiterStr,
-    ].concat(bwLines, [
-      "Total dispatches: " + d.count,
-      "Aggregate percent runtime: " + d.percentage.toFixed(5) + " %"
-    ]) : [
-      "Name: " + d.nameDisplay,
-      "Index: " + d.index + " / " + d.totalKernels,
-      aiLabel + aiVal,
-      "Achieved throughput: " + formatThroughput(d.throughput),
-      "Peak throughput: " + peakStr,
-      "Percent of roofline achieved: " + pctRoof,
-      "Performance limiter: " + limiterStr,
-    ].concat(bwLines, [
-      "Aggregate percent runtime: " + d.percentageAggregate.toFixed(5) + " %",
-      "Individual percent runtime: " + d.percentage.toFixed(5) + " %"
-    ]);
-    const mixLines = instMixLines(d);
-    if (mixLines.length) {
-      lines.push("");
+    const roofRows = [
+      [(showLinear ? "Linear Rooflines" : roofLabel) + " performance limiter:", limiterStr],
+      [roofLabel + " roofline peak throughput:", formatThroughput(peakVal)],
+    ];
+    if (bwValid && limiterMemoryLevel(limiterStr) === region && Number.isFinite(peakVal)) {
+      roofRows.push([roofLabel + " roofline peak " + region + " bandwidth:", formatBandwidth(peakVal / aiRegion)]);
     }
-    return lines.concat(mixLines).join(nl);
+    roofRows.push(["Percent of " + roofLabel.toLowerCase() + " roofline achieved:", pctRoof]);
+
+    const runtimeRows = m.aggregate ? [
+      ["Total contribution to GPU time:", formatPct(d.percentage)],
+      ["Total runtime (all dispatches):", formatRuntime(d.runtimeNs, "s")],
+      ["Average runtime per dispatch:", formatRuntime(d.averageNs, "ms")],
+      ["Total dispatches:", String(d.count)],
+    ] : [
+      ["Dispatch index:", d.index + " / " + d.totalKernels],
+      ["Individual contribution to GPU time:", formatPct(d.percentage)],
+      ["Total kernel contribution to GPU time:", formatPct(d.percentageAggregate)],
+      ["Individual runtime:", formatRuntime(d.runtimeNs, "ms")],
+    ];
+
+    return layoutTooltip(d.kernelName, [runtimeRows].concat(
+      countSections(d, m.aggregate, region),
+      [instMixRows(d), achievedRows, roofRows]
+    ));
   }
 
   function refreshDotTooltipIfNeeded() {
@@ -2444,9 +2537,10 @@ __D3_SCRIPT__
         }
         refreshRooflinesForDotHover();
         tooltip.style("display", "block").text(tooltipHtml(d));
+        moveTooltip(event);
       })
       .on("mousemove", function(event) {
-        tooltip.style("left", (event.clientX + 14) + "px").style("top", (event.clientY + 14) + "px");
+        moveTooltip(event);
       })
       .on("mouseleave", function() {
         roofHoverKernelName = null;
@@ -2462,14 +2556,19 @@ __D3_SCRIPT__
   }
 
   function avgStarTooltip(d) {
-    const nl = String.fromCharCode(10);
-    const key = regionKey();
-    const aiVal = d.ai[key];
-    return [
-      "Full application (average of all kernels)",
-      "AI (" + key + "): " + (aiVal != null && Number.isFinite(aiVal) ? aiVal : "N/A"),
-      "Achieved throughput: " + formatThroughput(d.throughput)
-    ].join(nl);
+    const region = regionKey();
+    const aiRegion = d.ai[region];
+    const achievedRows = [["Achieved throughput:", formatThroughput(d.throughput)]];
+    if (aiRegion != null && Number.isFinite(aiRegion) && aiRegion > 0
+        && d.throughput != null && Number.isFinite(d.throughput)) {
+      achievedRows.push(["Achieved " + region + " bandwidth:", formatBandwidth(d.throughput / aiRegion)]);
+    }
+    return layoutTooltip("Full application (average of all kernels)", [
+      [["Total application GPU time:", formatRuntime(d.runtimeNs, "s")]],
+    ].concat(
+      countSections(d, false, region),
+      [achievedRows]
+    ));
   }
 
   const avgStarSymbol = d3.symbol().type(d3.symbolStar).size(100);
@@ -2514,9 +2613,10 @@ __D3_SCRIPT__
       })
       .on("mouseenter", function(event, d) {
         tooltip.style("display", "block").text(avgStarTooltip(d));
+        moveTooltip(event);
       })
       .on("mousemove", function(event) {
-        tooltip.style("left", (event.clientX + 14) + "px").style("top", (event.clientY + 14) + "px");
+        moveTooltip(event);
       })
       .on("mouseleave", function() {
         tooltip.style("display", "none");
@@ -2874,7 +2974,11 @@ __D3_SCRIPT__
     redraw();
   }
   memSel.addEventListener("change", onViewControlsChange);
-  viewSel.addEventListener("change", onViewControlsChange);
+  viewBtn.addEventListener("click", () => {
+    aggregateView = !aggregateView;
+    syncViewToggle();
+    onViewControlsChange();
+  });
   slider.addEventListener("input", () => {
     thresholdIndex = +slider.value;
     redraw();
@@ -3428,7 +3532,6 @@ def extract(
                 {
                     "id": f"{kid}\x00{idx}",
                     "kernelName": str(kid),
-                    "nameDisplay": _wrap_kernel_name_tooltip(str(kid)),
                     "ai": {
                         "HBM": _json_safe_float(row["AI_HBM_TOT"]),
                         "L2": _json_safe_float(row["AI_L2_TOT"]),
@@ -3440,6 +3543,13 @@ def extract(
                     "percentage": _json_safe_float(row["Percentage"]),
                     "percentageAggregate": _json_safe_float(row["PercentageAggregate"]),
                     "runtimeNs": _json_safe_float(row["DurationNs"]),
+                    "totalOps": _json_safe_float(row["TOTAL_OPS"]),
+                    "bytes": {
+                        "HBM": _json_safe_float(row["BYTES_HBM"]),
+                        "L2": _json_safe_float(row["BYTES_L2"]),
+                        "vL1d": _json_safe_float(row["BYTES_vL1d"]),
+                        "LDS": _json_safe_float(row["BYTES_LDS"]),
+                    },
                     "cumulativePct": _json_safe_float(row["CumulativePercentageAbove"]),
                     "index": int(row["Index"]) if pd.notna(row["Index"]) else 0,
                     "totalKernels": int(row["TotalKernels"]),
@@ -3453,13 +3563,17 @@ def extract(
                 }
             )
 
+        _kernel_totals = df_roof.groupby("KernelName")[
+            ["TOTAL_OPS", "BYTES_HBM", "BYTES_L2", "BYTES_vL1d", "BYTES_LDS"]
+        ].sum(min_count=1)
+
         aggregate = []
         for index, kernel in df.iterrows():
+            _kt = _kernel_totals.loc[index] if index in _kernel_totals.index else pd.Series(dtype=float)
             aggregate.append(
                 {
                     "id": str(index),
                     "kernelName": str(index),
-                    "nameDisplay": _wrap_kernel_name_tooltip(str(index)),
                     "ai": {
                         "HBM": _json_safe_float(kernel["AI_HBM_TOT"]),
                         "L2": _json_safe_float(kernel["AI_L2_TOT"]),
@@ -3471,6 +3585,14 @@ def extract(
                     "percentage": _json_safe_float(kernel["Percentage"]),
                     "cumulativePct": _json_safe_float(kernel["CumulativePercentageAbove"]),
                     "runtimeNs": _json_safe_float(kernel["RuntimeNs"]),
+                    "averageNs": _json_safe_float(kernel["AverageNs"]),
+                    "totalOps": _json_safe_float(_kt.get("TOTAL_OPS")),
+                    "bytes": {
+                        "HBM": _json_safe_float(_kt.get("BYTES_HBM")),
+                        "L2": _json_safe_float(_kt.get("BYTES_L2")),
+                        "vL1d": _json_safe_float(_kt.get("BYTES_vL1d")),
+                        "LDS": _json_safe_float(_kt.get("BYTES_LDS")),
+                    },
                     "peak": _json_safe_float(kernel["PEAK"]),
                     "peakLinear": _json_safe_float(kernel.get("PEAK_LINEAR")),
                     "limiter": str(kernel["LIMITER"]),
@@ -3537,7 +3659,6 @@ def extract(
 
         average_payload = {
             "kernelName": "Full application (average of all kernels)",
-            "nameDisplay": "Full application (average of all kernels)",
             "ai": {
                 "HBM": _json_safe_float(_avg_ai("BYTES_HBM")),
                 "L2": _json_safe_float(_avg_ai("BYTES_L2")),
@@ -3547,6 +3668,14 @@ def extract(
             "throughput": _json_safe_float(
                 _avg_total_ops / _avg_total_ns if _avg_total_ns > 0 else None
             ),
+            "totalOps": _json_safe_float(_avg_total_ops),
+            "bytes": {
+                "HBM": _json_safe_float(df_roof["BYTES_HBM"].sum()),
+                "L2": _json_safe_float(df_roof["BYTES_L2"].sum()),
+                "vL1d": _json_safe_float(df_roof["BYTES_vL1d"].sum()),
+                "LDS": _json_safe_float(df_roof["BYTES_LDS"].sum()),
+            },
+            "runtimeNs": _json_safe_float(_avg_total_ns),
         }
 
         payload = {
