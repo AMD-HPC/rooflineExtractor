@@ -8,6 +8,7 @@ import pdb
 import shutil
 import argparse
 import json
+import math
 import requests
 
 from pathlib import Path
@@ -1341,6 +1342,11 @@ __D3_SCRIPT__
 <script>
 (function() {
   const data = JSON.parse(document.getElementById("roofline-json").textContent);
+  // Keyed by position: (kernel, index) repeats across ranks in MPI traces.
+  data.dispatch.forEach(function(d, i) {
+    d.kernelName = data.dispatchKernelNames[d.k];
+    d.id = "d" + i;
+  });
   const meta = data.meta;
   const cacheKeys = data.cacheKeys;
   // Memory regions ordered from closest to compute to furthest away. When a single
@@ -3483,7 +3489,7 @@ def extract(
         n_samples_cap = 50000
         if len(df_plot) > n_samples_cap:
             df_plot = df_plot.sort_values("Index")
-            df_plot = df_plot.iloc[:: len(df_plot) // n_samples_cap]
+            df_plot = df_plot.iloc[:: math.ceil(len(df_plot) / n_samples_cap)]
 
         df_plot = df_plot.sort_values(by="PercentageAggregate", ascending=False)
 
@@ -3524,14 +3530,21 @@ def extract(
                 {"key": key, "x": x_vals.tolist(), "y": y_line.tolist()}
             )
 
+        # Kernel names can be several KB of C++ template text; repeating them per
+        # dispatch can push the payload past V8's ~512 MiB max string length,
+        # which leaves the page blank. Dispatches reference dispatchKernelNames by "k".
+        dispatch_kernel_names = []
+        _kernel_name_index = {}
         dispatch = []
         for _, row in df_plot.iterrows():
-            kid = row["KernelName"]
-            idx = row["Index"]
+            kid = str(row["KernelName"])
+            k = _kernel_name_index.get(kid)
+            if k is None:
+                k = _kernel_name_index[kid] = len(dispatch_kernel_names)
+                dispatch_kernel_names.append(kid)
             dispatch.append(
                 {
-                    "id": f"{kid}\x00{idx}",
-                    "kernelName": str(kid),
+                    "k": k,
                     "ai": {
                         "HBM": _json_safe_float(row["AI_HBM_TOT"]),
                         "L2": _json_safe_float(row["AI_L2_TOT"]),
@@ -3706,6 +3719,7 @@ def extract(
             "rooflines": rooflines_payload,
             "thresholds": [float(t) for t in thresholds],
             "average": average_payload,
+            "dispatchKernelNames": dispatch_kernel_names,
             "dispatch": dispatch,
             "aggregate": aggregate,
             "kernelLegend": kernel_legend,
