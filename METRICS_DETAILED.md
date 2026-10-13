@@ -26,18 +26,17 @@ This document provides equations, descriptions, and hardware counter information
 
 ### Total Operations Per Dispatch
 
-**Description**: The total number of operations (FLOPs and integer ops) executed per kernel dispatch.
+**Description**: The total number of vector and matrix operations (FLOPs and integer ops) executed per kernel dispatch.
 
 **Equation**:
 ```
-TOTAL_OPS = TOTAL_SALU + TOTAL_VALU_F16 + TOTAL_VALU_F32 + TOTAL_VALU_F64 + 
+TOTAL_OPS = TOTAL_VALU_F16 + TOTAL_VALU_F32 + TOTAL_VALU_F64 + 
             TOTAL_VALU_I32 + TOTAL_VALU_I64 + TOTAL_MOPS_F16 + TOTAL_MOPS_BF16 + 
             TOTAL_MOPS_F32 + TOTAL_MOPS_F64 [+ TOTAL_MOPS_F8] [+ TOTAL_MOPS_I8]
             [+ TOTAL_MOPS_F6F4] [+ TOTAL_VALU_OTHER]
 ```
 
 Where:
-- `TOTAL_SALU = SQ_INSTS_SALU`
 - `TOTAL_VALU_F16 = 64 × (SQ_INSTS_VALU_ADD_F16 + SQ_INSTS_VALU_MUL_F16 + SQ_INSTS_VALU_TRANS_F16 + 2 × SQ_INSTS_VALU_FMA_F16)`
 - `TOTAL_VALU_F32 = 64 × (SQ_INSTS_VALU_ADD_F32 + SQ_INSTS_VALU_MUL_F32 + SQ_INSTS_VALU_TRANS_F32 + 2 × SQ_INSTS_VALU_FMA_F32)`
 - `TOTAL_VALU_F64 = 64 × (SQ_INSTS_VALU_ADD_F64 + SQ_INSTS_VALU_MUL_F64 + SQ_INSTS_VALU_TRANS_F64 + 2 × SQ_INSTS_VALU_FMA_F64)`
@@ -291,6 +290,7 @@ Where:
 Hardware counter: `SQ_INSTS_SALU`
 - Operations performed by the scalar ALU
 - Typically used for address calculations and control flow
+- Stored as `TOTAL_SALU`. Omitted from `TOTAL_OPS` since it goes through a separate pipe.
 
 ### Vector ALU Operations (VALU)
 

@@ -426,7 +426,6 @@ def _compute_inst_mix_payload(row, peaks):
         ("BF16 MFMA",   row['TOTAL_MOPS_BF16'],                peaks.get('bf16_mfma')),
         ("FP32 MFMA",   row['TOTAL_MOPS_F32'],                 peaks.get('fp32_mfma')),
         ("FP64 MFMA",   row['TOTAL_MOPS_F64'],                 peaks.get('fp64_mfma')),
-        ("SALU",        row['TOTAL_SALU'],                     None),
     ]
     if 'TOTAL_MOPS_F8' in row.index:
         inst_mix.append(("FP8 MFMA", row['TOTAL_MOPS_F8'], peaks.get('fp8_mfma')))
@@ -488,7 +487,7 @@ def _compute_kernel_peak(df, peaks):
     if 'f6f4_mfma' in peaks and 'TOTAL_MOPS_F6F4' in df.columns:
         weighted_time += df['TOTAL_MOPS_F6F4'] / peaks['f6f4_mfma']
 
-    return ((df['TOTAL_OPS'] - df['TOTAL_SALU']) / weighted_time).replace(np.inf, 0)
+    return (df['TOTAL_OPS'] / weighted_time).replace(np.inf, 0)
 
 
 _JKL_ALPHA_BY_LABEL_CACHE = {}
@@ -846,8 +845,8 @@ def compute_flops(df, arch):
     # Concat first batch of columns
     df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
-    ## Total
-    TOTAL_OPS = df['TOTAL_SALU'] + df['TOTAL_VALU_F16'] + df['TOTAL_VALU_F32'] + df['TOTAL_VALU_F64'] + df['TOTAL_VALU_I32'] + df['TOTAL_VALU_I64'] + df['TOTAL_MOPS_F16'] + df['TOTAL_MOPS_BF16'] + df['TOTAL_MOPS_F32'] + df['TOTAL_MOPS_F64']
+    ## Total VALU/MFMA
+    TOTAL_OPS = df['TOTAL_VALU_F16'] + df['TOTAL_VALU_F32'] + df['TOTAL_VALU_F64'] + df['TOTAL_VALU_I32'] + df['TOTAL_VALU_I64'] + df['TOTAL_MOPS_F16'] + df['TOTAL_MOPS_BF16'] + df['TOTAL_MOPS_F32'] + df['TOTAL_MOPS_F64']
     if 'SQ_INSTS_VALU' in df.columns:
         TOTAL_OPS = TOTAL_OPS + df['TOTAL_VALU_OTHER']
     if 'SQ_INSTS_VALU_MFMA_MOPS_F8' in df.columns:
@@ -3296,7 +3295,6 @@ def extract(
                 ("BF16 MFMA",   row['TOTAL_MOPS_BF16'],                _peaks_agg.get('bf16_mfma')),
                 ("FP32 MFMA",   row['TOTAL_MOPS_F32'],                 _peaks_agg.get('fp32_mfma')),
                 ("FP64 MFMA",   row['TOTAL_MOPS_F64'],                 _peaks_agg.get('fp64_mfma')),
-                ("SALU",        row['TOTAL_SALU'],                     None),
             ]
             if 'TOTAL_MOPS_F8' in row.index:
                 inst_mix.append(("FP8 MFMA", row['TOTAL_MOPS_F8'], _peaks_agg.get('fp8_mfma')))

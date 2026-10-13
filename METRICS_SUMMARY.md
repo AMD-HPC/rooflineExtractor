@@ -26,7 +26,8 @@ When you run roofline extractor, the following metrics are displayed for each ke
 
 **Total operations per dispatch**
 - The total number of floating-point and integer operations executed in a single kernel launch
-- Includes scalar, vector, and matrix operations across all data types (FP16, FP32, FP64, INT32, INT64, etc.)
+- Counts vector and matrix operations across all data types (FP16, FP32, FP64, INT32, INT64, etc.)
+- Scalar ALU operations are reported separately as `TOTAL_SALU`
 - Collected from rocprofv3
 
 **Average runtime per dispatch**
