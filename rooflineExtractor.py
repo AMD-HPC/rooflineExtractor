@@ -399,6 +399,60 @@ def _load_peaks(df_bw, arch_col, df):
     return peaks
 
 
+# Options for the HTML "Precision" dropdown: (key, label, ops column, peak key, alpha label).
+# Peak keys index the dict from _load_peaks; alpha labels index the alpha summary CSVs and
+# match the per-class labels used in _compute_weighted_jkl_alpha.
+PRECISION_OPTIONS = [
+    ('fp64_mfma',  'FP64 MFMA',   'TOTAL_MOPS_F64',  'fp64_mfma',   'fp64_mfma'),
+    ('fp64_valu',  'FP64 VALU',   'TOTAL_VALU_F64',  'fp64_muladd', 'fp64_muladd'),
+    ('fp32_mfma',  'FP32 MFMA',   'TOTAL_MOPS_F32',  'fp32_mfma',   'fp32_mfma'),
+    ('fp32_valu',  'FP32 VALU',   'TOTAL_VALU_F32',  'fp32_muladd', 'fp32_muladd'),
+    ('fp16_mfma',  'FP16 MFMA',   'TOTAL_MOPS_F16',  'fp16_mfma',   'fp16_mfma'),
+    ('fp16_valu',  'FP16 VALU',   'TOTAL_VALU_F16',  'fp16_mul',    'fp16_mul'),
+    ('bf16_mfma',  'BF16 MFMA',   'TOTAL_MOPS_BF16', 'bf16_mfma',   'bf16_mfma'),
+    ('fp8_mfma',   'FP8 MFMA',    'TOTAL_MOPS_F8',   'fp8_mfma',    'fp8_mfma'),
+    ('i8_mfma',    'INT8 MFMA',   'TOTAL_MOPS_I8',   'i8_mfma',     'int8_mfma'),
+    ('f6f4_mfma',  'F6F4 MFMA',   'TOTAL_MOPS_F6F4', 'f6f4_mfma',   'fp4_mfma'),
+    ('int32_valu', 'INT32 VALU',  'TOTAL_VALU_I32',  'int32',       'int32_mul'),
+    ('int64_valu', 'INT64 VALU',  'TOTAL_VALU_I64',  'int64',       'int32_muladd'),
+    ('other_valu', 'Other',       'TOTAL_VALU_OTHER', 'other',      'int8_leftshift'),
+]
+
+# Instruction-mix labels (from _compute_inst_mix_payload) that make up each precision's ops column.
+PRECISION_INST_MIX_LABELS = {
+    'fp64_mfma':  ['FP64 MFMA'],
+    'fp64_valu':  ['FP64 Add', 'FP64 Mul', 'FP64 MulAdd', 'FP64 Trans'],
+    'fp32_mfma':  ['FP32 MFMA'],
+    'fp32_valu':  ['FP32 Add', 'FP32 Mul', 'FP32 MulAdd', 'FP32 Trans'],
+    'fp16_mfma':  ['FP16 MFMA'],
+    'fp16_valu':  ['FP16 Add', 'FP16 Mul', 'FP16 MulAdd', 'FP16 Trans'],
+    'bf16_mfma':  ['BF16 MFMA'],
+    'fp8_mfma':   ['FP8 MFMA'],
+    'i8_mfma':    ['I8 MFMA'],
+    'f6f4_mfma':  ['F6F4 MFMA'],
+    'int32_valu': ['INT32'],
+    'int64_valu': ['INT64'],
+    'other_valu': ['Other VALU'],
+}
+
+
+def _available_precisions(df, peaks):
+    """PRECISION_OPTIONS entries whose ops column is present in df and whose peak is finite and > 0."""
+    out = []
+    for key, label, ops_col, peak_key, alpha_label in PRECISION_OPTIONS:
+        if ops_col not in df.columns:
+            continue
+        peak = peaks.get(peak_key)
+        try:
+            peak = float(peak)
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(peak) or peak <= 0:
+            continue
+        out.append((key, label, ops_col, peak, alpha_label))
+    return out
+
+
 def _compute_inst_mix_payload(row, peaks):
     """Per-kernel instruction-mix breakdown for the interactive plot tooltip.
 
@@ -1291,6 +1345,7 @@ __D3_SCRIPT__
       <h3 id="plot-info-heading">Implementation Details and Disclaimers</h3>
       <ul>
         <li><b>Peak compute:</b> The peak compute is based on the instruction mix of each kernel. It is the weighted average of the measured throughput of each instruction counted in the kernel. Clicking on or hovering the mouse over a kernel dot will show that kernel's empirical peak compute. If none is selected, the default peak compute displayed is FP64 MFMA.</li>
+        <li><b>Precision:</b> "All (instruction mix)" counts every operation and uses each kernel's instruction-mix peak compute. Choosing a single precision (e.g. FP64 MFMA) counts only that precision's operations in each kernel's total, so arithmetic intensity and throughput change, and uses that precision's empirical peak as the compute roof for every kernel. Kernels with no operations of that precision are hidden. FP64 and FP32 VALU peaks use the MulAdd microbenchmark, FP16 VALU uses the Mul microbenchmark; INT32, INT64, and Other (the "Other VALU" category) use the same peaks as the instruction-mix calculation.</li>
         <li><b>Application-average star:</b> The gold star marks the whole application's aggregate point: arithmetic intensity computed as total FLOPs / total bytes accessed and throughput as total FLOPs / total kernel time, across all dispatches. Its arithmetic intensity follows the currently selected memory region.</li>
         <li><b>Total FLOPs:</b> The "flops" value reported includes floating point AND integer operations. These operations all go through the same VALU pipe, so they should be counted together. </li>
         <li><b>Curved rooflines:</b> HBM and LDS rooflines are drawn with a curved shape. This is because workloads that are demanding in bandwidth AND compute consume more power, and subsequently get their clocks throttled. So, the roofline peak is lower in the "knee" region, where the bandwidth and compute lines meet. </li>
@@ -1304,6 +1359,11 @@ __D3_SCRIPT__
   <div class="toolbar">
     <label>Memory Region
       <select id="memory-region-select" aria-label="Memory hierarchy for arithmetic intensity"></select>
+    </label>
+    <label>Precision
+      <select id="precision-select" aria-label="Precision used for operation counts and the compute roof">
+        <option value="all">All (instruction mix)</option>
+      </select>
     </label>
     <div class="toolbar-field">View
       <button type="button" id="btn-view-toggle" title="Plot each kernel dispatch as its own point">Show Individual Dispatches</button>
@@ -1391,6 +1451,111 @@ __D3_SCRIPT__
   }
   /** When false, HBM/LDS use linear min(AI×B, P) even if α model metadata is present. */
   let useCurvedHbmLdsRooflines = true;
+
+  // Precision dropdown. "all" keeps the per-kernel instruction-mix compute peak and
+  // TOTAL_OPS; any other entry counts only that precision's ops and uses its peak as
+  // the flat compute roof for every kernel.
+  const precisions = meta.precisions || [];
+  const precSel = document.getElementById("precision-select");
+  precisions.forEach(function(p) {
+    const opt = document.createElement("option");
+    opt.value = p.key;
+    opt.textContent = p.label;
+    precSel.appendChild(opt);
+  });
+  precSel.value = "all";
+  /** Selected meta.precisions entry, or null for "All (instruction mix)". */
+  let activePrecision = null;
+  const precisionViewCache = {};
+
+  // Same column order as the Python peak frames so ties resolve to the same limiter as idxmin.
+  const LIMITER_MEM_ORDER = ["HBM", "L2", "vL1d", "LDS"];
+
+  /** Mirrors compute_flops: linear and curved roof peaks/limiters at a row's AI for compute peak P. */
+  function precisionRoofs(ai, P, prec) {
+    const suffix = " (" + meta.arch + ")";
+    let lin = { v: P, label: "KERNEL_COMPUTE" };
+    let cur = { v: P, label: "KERNEL_COMPUTE" };
+    const memLin = [];
+    const memCur = [];
+    LIMITER_MEM_ORDER.forEach(function(k) {
+      const bw = data.bandwidths[k];
+      const a = ai[k];
+      if (bw == null || !(bw > 0) || a == null || !(a > 0) || !Number.isFinite(a)) return;
+      const linear = a * bw;
+      let curved = linear;
+      const alpha = k === "HBM" && meta.useHbmAlphaModel === true ? prec.hbmAlpha
+        : k === "LDS" && meta.useLdsAlphaModel === true ? prec.ldsAlpha
+        : null;
+      if (alpha != null && Number.isFinite(alpha)) {
+        const c = hbmRoofThroughput(a, bw, P, alpha);
+        if (Number.isFinite(c) && c > 0) curved = c;
+      }
+      memLin.push({ v: linear, label: k + "_BW" });
+      memCur.push({ v: curved, label: k + "_BW" });
+    });
+    function pickMin(mem, computeEntry) {
+      let best = null;
+      mem.concat([computeEntry]).forEach(function(e) {
+        if (!(e.v > 0) || !Number.isFinite(e.v)) return;
+        if (best == null || e.v < best.v) best = e;
+      });
+      return best;
+    }
+    lin = pickMin(memLin, lin);
+    cur = pickMin(memCur, cur);
+    const limiterLinear = lin ? lin.label + suffix : "Unknown" + suffix;
+    let limiter = cur ? cur.label + suffix : "Unknown" + suffix;
+    // _align_curved_limiter_with_linear_compute: curved HBM/LDS knee under a compute-bound linear roof.
+    if (lin && lin.label === "KERNEL_COMPUTE" && cur && (cur.label === "HBM_BW" || cur.label === "LDS_BW")) {
+      limiter = limiterLinear;
+    }
+    return {
+      peak: cur ? cur.v : null,
+      peakLinear: lin ? lin.v : null,
+      limiter: limiter,
+      limiterLinear: limiterLinear,
+    };
+  }
+
+  /** Copy of a dispatch/aggregate/average row with ops, AI, throughput, and roofs for one precision. */
+  function derivePrecisionRow(d, prec) {
+    const ops = d.opsByPrecision ? d.opsByPrecision[prec.key] : null;
+    const hasOps = ops != null && Number.isFinite(ops) && ops > 0;
+    const ai = {};
+    cacheKeys.forEach(function(k) {
+      const b = d.bytes ? d.bytes[k] : null;
+      ai[k] = hasOps && b != null && Number.isFinite(b) && b > 0 ? ops / b : null;
+    });
+    const rt = d.runtimeNs;
+    const throughput = hasOps && rt != null && Number.isFinite(rt) && rt > 0 ? ops / rt : null;
+    const roofs = precisionRoofs(ai, prec.peak, prec);
+    return Object.assign({}, d, {
+      totalOps: ops,
+      ai: ai,
+      throughput: throughput,
+      peak: roofs.peak,
+      peakLinear: roofs.peakLinear,
+      limiter: roofs.limiter,
+      limiterLinear: roofs.limiterLinear,
+      kernelComputePeak: prec.peak,
+    });
+  }
+
+  /** {dispatch, aggregate, average} for the selected precision (the original payload for "all"). */
+  function currentView() {
+    if (!activePrecision) return data;
+    const key = activePrecision.key;
+    if (!precisionViewCache[key]) {
+      const prec = activePrecision;
+      precisionViewCache[key] = {
+        dispatch: data.dispatch.map(function(d) { return derivePrecisionRow(d, prec); }),
+        aggregate: data.aggregate.map(function(d) { return derivePrecisionRow(d, prec); }),
+        average: data.average ? derivePrecisionRow(data.average, prec) : null,
+      };
+    }
+    return precisionViewCache[key];
+  }
   document.getElementById("chart-title").textContent = meta.title;
   const disc = document.getElementById("disclaimer");
   disc.textContent = meta.disclaimer || "";
@@ -1461,7 +1626,12 @@ __D3_SCRIPT__
     if (cp != null && Number.isFinite(cp)) {
       lines.push("Compute peak (flat roof): " + cp.toLocaleString(undefined, { maximumFractionDigits: 2 }) + " GFLOPs/s");
     }
-    if (hbmAlphaOn && cacheKey === "HBM") {
+    if (activePrecision) {
+      if (curvedOn) {
+        lines.push("alpha: " + activePrecision.label + " microbenchmark.");
+      }
+      lines.push(computeRoofFlatDisclaimer());
+    } else if (hbmAlphaOn && cacheKey === "HBM") {
       if (kernelHbmAlpha() != null) {
         lines.push("α: instruction-mix weighted (hovered or selected kernel).");
       } else if (meta.defaultHbmAlphaFp64Mfma != null && Number.isFinite(meta.defaultHbmAlphaFp64Mfma)) {
@@ -1573,6 +1743,9 @@ __D3_SCRIPT__
   }
 
   function effectiveComputePeak() {
+    if (activePrecision) {
+      return activePrecision.peak;
+    }
     if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
       return roofHoverDispatchComputePeak;
     }
@@ -1594,6 +1767,9 @@ __D3_SCRIPT__
 
   /** Matches effectiveComputePeak(): text for the flat compute roof P in tooltips (incl. HBM/LDS α model). */
   function computeRoofFlatDisclaimer() {
+    if (activePrecision) {
+      return "(Compute roof: " + activePrecision.label + " peak for every kernel.)";
+    }
     if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
       return "(Compute roof: instruction-mix ceiling for hovered dispatch.)";
     }
@@ -1648,6 +1824,10 @@ __D3_SCRIPT__
   }
 
   function hbmAlphaForRoofline() {
+    if (activePrecision) {
+      const a = activePrecision.hbmAlpha;
+      return a != null && Number.isFinite(a) ? { alpha: a } : null;
+    }
     const k = kernelHbmAlpha();
     if (k != null) {
       return k;
@@ -1659,6 +1839,10 @@ __D3_SCRIPT__
   }
 
   function ldsAlphaForRoofline() {
+    if (activePrecision) {
+      const a = activePrecision.ldsAlpha;
+      return a != null && Number.isFinite(a) ? { alpha: a } : null;
+    }
     const k = kernelLdsAlpha();
     if (k != null) {
       return k;
@@ -1779,7 +1963,7 @@ __D3_SCRIPT__
     // Under "All regions" a kernel is plotted if any region gives it a usable AI.
     const keys = allRegionsActive() ? cacheKeys : [regionKey()];
     const agg = currentMode().aggregate;
-    const src = agg ? data.aggregate : data.dispatch;
+    const src = agg ? currentView().aggregate : currentView().dispatch;
     const visible = new Set();
     for (let i = 0; i < src.length; i++) {
       const d = src[i];
@@ -1961,6 +2145,7 @@ __D3_SCRIPT__
 
   function updateAvgStarLegendRow() {
     if (!avgStarLegendRow) return;
+    avgStarLegendRow.style.display = avgStarDataValid() ? "" : "none";
     const dimmed = kernelFilterActive() && !avgStarSelected;
     avgStarLegendRow.classList.toggle("kernel-legend-selected", avgStarSelected);
     avgStarLegendRow.classList.toggle("kernel-legend-dimmed", dimmed);
@@ -2184,7 +2369,7 @@ __D3_SCRIPT__
     const t = th[thresholdIndex];
     const key = regionKey();
     const agg = currentMode().aggregate;
-    const src = agg ? data.aggregate : data.dispatch;
+    const src = agg ? currentView().aggregate : currentView().dispatch;
     return src.filter(d => {
       const c = d.cumulativePct;
       if (c == null || !Number.isFinite(c) || c > t) return false;
@@ -2254,7 +2439,8 @@ __D3_SCRIPT__
       personalTitle = kp != null && Number.isFinite(kp) && kp > 0;
     }
     legendG.select(".legend-title").text(
-      personalTitle ? "Achievable peak (instruction-mix roof)" : "Achievable peak (by memory)"
+      activePrecision ? "Achievable peak (" + activePrecision.label + " roof)"
+        : personalTitle ? "Achievable peak (instruction-mix roof)" : "Achievable peak (by memory)"
     );
   }
 
@@ -2277,6 +2463,7 @@ __D3_SCRIPT__
     if (!mix || !mix.length) return [];
     const rows = [];
     let otherValu = false;
+    const precLabels = activePrecision ? (activePrecision.instMixLabels || []) : [];
     mix.forEach(function(e) {
       let label = e.label;
       if (label === "Other VALU") {
@@ -2286,11 +2473,15 @@ __D3_SCRIPT__
       const peakStr = (e.peakTFlops != null && Number.isFinite(e.peakTFlops))
         ? e.peakTFlops.toFixed(1) + " TFLOPs/s"
         : "N/A";
-      rows.push(["  " + (label + ":").padEnd(20) + " " + e.pct.toFixed(1).padStart(5) + "%   ", "(" + peakStr + ")"]);
+      rows.push({
+        head: "  " + (label + ":").padEnd(20) + " " + e.pct.toFixed(1).padStart(5) + "%   ",
+        peak: "(" + peakStr + ")",
+        bold: precLabels.indexOf(e.label) >= 0,
+      });
     });
     // Preformatted rather than a [label, value] row so the header lines up with the peak column.
-    const out = ["Instruction mix:".padEnd(rows[0][0].length) + "(roofline peak)"];
-    rows.forEach(function(r) { out.push(r[0] + r[1]); });
+    const out = ["Instruction mix:".padEnd(rows[0].head.length) + "(roofline peak)"];
+    rows.forEach(function(r) { out.push({ text: r.head + r.peak, bold: r.bold }); });
     if (otherValu) {
       out.push('  * "Other VALU" refers to instructions not covered by the other categories.');
       out.push("    We use the peak throughput value of v_lshlrev_b32_e32 here.");
@@ -2307,22 +2498,42 @@ __D3_SCRIPT__
     return out;
   }
 
+  function escapeHtml(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }
+
   // Lay out a tooltip like a CLI kernel block: header (wrapped to the width of
   // the body), then sections, each preceded by a blank line. Rows are
-  // [label, value] pairs (labels padded to a common width) or preformatted strings.
+  // [label, value] pairs (labels padded to a common width; an optional third element
+  // is a substring of the label to bold), preformatted strings, or preformatted
+  // {text, bold} lines. Returns HTML for tooltip.html().
   function layoutTooltip(header, sections) {
     const rows = [].concat.apply([], sections).filter(Array.isArray);
     const w = Math.max.apply(null, [0].concat(rows.map(function(r) { return r[0].length; })));
     const body = [];
     sections.forEach(function(sec) {
       if (!sec.length) return;
-      body.push("");
+      body.push({ text: "" });
       sec.forEach(function(r) {
-        body.push(Array.isArray(r) ? r[0].padEnd(w) + " " + r[1] : r);
+        if (Array.isArray(r)) body.push({ text: r[0].padEnd(w) + " " + r[1], boldSpan: r[2] });
+        else if (typeof r === "string") body.push({ text: r });
+        else body.push(r);
       });
     });
-    const bodyW = Math.max.apply(null, [40].concat(body.map(function(l) { return l.length; })));
-    return wrapText(header, bodyW, 3).concat(body).join(String.fromCharCode(10));
+    const bodyW = Math.max.apply(null, [40].concat(body.map(function(l) { return l.text.length; })));
+    const lines = wrapText(header, bodyW, 3).map(function(t) { return { text: t }; }).concat(body);
+    return lines.map(function(l) {
+      if (l.bold) return "<b>" + escapeHtml(l.text) + "</b>";
+      const i = l.boldSpan ? l.text.indexOf(l.boldSpan) : -1;
+      if (i < 0) return escapeHtml(l.text);
+      const j = i + l.boldSpan.length;
+      return escapeHtml(l.text.slice(0, i)) + "<b>" + escapeHtml(l.boldSpan) + "</b>" + escapeHtml(l.text.slice(j));
+    }).join(String.fromCharCode(10));
+  }
+
+  function achievedThroughputRow(throughput) {
+    if (!activePrecision) return ["Achieved throughput:", formatThroughput(throughput)];
+    return ["Achieved " + activePrecision.label + " throughput:", formatThroughput(throughput), activePrecision.label];
   }
 
   // Mirror the CLI _format_throughput: show TFLOPs/s once we hit >= 1 TFLOPs/s.
@@ -2390,7 +2601,9 @@ __D3_SCRIPT__
   function countSections(d, allDispatches, region) {
     const b = d.bytes || {};
     const ai = d.ai || {};
-    const opsLabel = allDispatches ? "Total operations (all dispatches):" : "Total operations:";
+    const opsScope = activePrecision ? activePrecision.label + (allDispatches ? ", all dispatches" : "")
+      : allDispatches ? "all dispatches" : "";
+    const opsLabel = opsScope ? "Total operations (" + opsScope + "):" : "Total operations:";
     const bytesLabel = allDispatches
       ? "Total bytes moved (" + region + ", all dispatches):"
       : "Total bytes moved (" + region + "):";
@@ -2433,7 +2646,7 @@ __D3_SCRIPT__
     const region = d.memRegion || regionKey();
     const aiRegion = d.ai[region];
     const bwValid = aiRegion != null && Number.isFinite(aiRegion) && aiRegion > 0;
-    const achievedRows = [["Achieved throughput:", formatThroughput(d.throughput)]];
+    const achievedRows = [achievedThroughputRow(d.throughput)];
     if (bwValid && d.throughput != null && Number.isFinite(d.throughput)) {
       achievedRows.push(["Achieved " + region + " bandwidth:", formatBandwidth(d.throughput / aiRegion)]);
     }
@@ -2466,7 +2679,7 @@ __D3_SCRIPT__
 
   function refreshDotTooltipIfNeeded() {
     if (dotTooltipDatum != null) {
-      tooltip.text(tooltipHtml(dotTooltipDatum));
+      tooltip.html(tooltipHtml(dotTooltipDatum));
     }
   }
 
@@ -2488,7 +2701,7 @@ __D3_SCRIPT__
     }
     const t = th[thresholdIndex];
     const agg = currentMode().aggregate;
-    const src = agg ? data.aggregate : data.dispatch;
+    const src = agg ? currentView().aggregate : currentView().dispatch;
     const expanded = [];
     // Closest-to-furthest order so further-away regions are appended last and
     // therefore drawn on top of closer ones when their dots overlap.
@@ -2541,7 +2754,7 @@ __D3_SCRIPT__
           roofHoverDispatchComputePeak = null;
         }
         refreshRooflinesForDotHover();
-        tooltip.style("display", "block").text(tooltipHtml(d));
+        tooltip.style("display", "block").html(tooltipHtml(d));
         moveTooltip(event);
       })
       .on("mousemove", function(event) {
@@ -2563,7 +2776,7 @@ __D3_SCRIPT__
   function avgStarTooltip(d) {
     const region = regionKey();
     const aiRegion = d.ai[region];
-    const achievedRows = [["Achieved throughput:", formatThroughput(d.throughput)]];
+    const achievedRows = [achievedThroughputRow(d.throughput)];
     if (aiRegion != null && Number.isFinite(aiRegion) && aiRegion > 0
         && d.throughput != null && Number.isFinite(d.throughput)) {
       achievedRows.push(["Achieved " + region + " bandwidth:", formatBandwidth(d.throughput / aiRegion)]);
@@ -2581,7 +2794,7 @@ __D3_SCRIPT__
   // The application-average point has valid data to plot if its throughput and at
   // least one region's arithmetic intensity are finite and positive.
   function avgStarDataValid() {
-    const avg = data.average;
+    const avg = currentView().average;
     if (!avg || avg.throughput == null || !Number.isFinite(avg.throughput) || avg.throughput <= 0) {
       return false;
     }
@@ -2593,7 +2806,7 @@ __D3_SCRIPT__
   }
 
   function drawAverageStar(xFn, yFn) {
-    const avg = data.average;
+    const avg = currentView().average;
     const key = regionKey();
     const aiVal = avg && avg.ai ? avg.ai[key] : null;
     // Shown by default; hidden when other kernels are isolated (and the star is not
@@ -2617,7 +2830,7 @@ __D3_SCRIPT__
         onAvgStarActivate(event);
       })
       .on("mouseenter", function(event, d) {
-        tooltip.style("display", "block").text(avgStarTooltip(d));
+        tooltip.style("display", "block").html(avgStarTooltip(d));
         moveTooltip(event);
       })
       .on("mousemove", function(event) {
@@ -2979,6 +3192,19 @@ __D3_SCRIPT__
     redraw();
   }
   memSel.addEventListener("change", onViewControlsChange);
+  precSel.addEventListener("change", () => {
+    activePrecision = precisions.find(p => p.key === precSel.value) || null;
+    roofHoverKernelName = null;
+    roofHoverDispatchComputePeak = null;
+    dotTooltipDatum = null;
+    tooltip.style("display", "none");
+    // Keep the flat roof on screen for precisions whose peak exceeds the default range (e.g. FP8 MFMA).
+    const yMax = activePrecision ? Math.max(meta.yMax, 2 * activePrecision.peak) : meta.yMax;
+    y0.domain([meta.yMin, yMax]);
+    transform = d3.zoomIdentity;
+    svg.call(zoom.transform, d3.zoomIdentity);
+    redraw();
+  });
   viewBtn.addEventListener("click", () => {
     aggregateView = !aggregateView;
     syncViewToggle();
@@ -3528,6 +3754,15 @@ def extract(
                 {"key": key, "x": x_vals.tolist(), "y": y_line.tolist()}
             )
 
+        _precisions = _available_precisions(df_roof, _peaks_agg)
+        _precision_ops_cols = [ops_col for _, _, ops_col, _, _ in _precisions]
+
+        def _ops_by_precision(src):
+            return {
+                key: _json_safe_float(src.get(ops_col))
+                for key, _, ops_col, _, _ in _precisions
+            }
+
         # Kernel names can be several KB of C++ template text; repeating them per
         # dispatch can push the payload past V8's ~512 MiB max string length,
         # which leaves the page blank. Dispatches reference dispatchKernelNames by "k".
@@ -3571,12 +3806,13 @@ def extract(
                     "limiterLinear": str(row["LIMITER_LINEAR"]) if "LIMITER_LINEAR" in row.index else None,
                     "color": str(row["color"]),
                     "instMix": _compute_inst_mix_payload(row, _peaks_agg),
+                    "opsByPrecision": _ops_by_precision(row),
                 }
             )
 
-        _kernel_totals = df_roof.groupby("KernelName")[
-            ["TOTAL_OPS", "BYTES_HBM", "BYTES_L2", "BYTES_vL1d", "BYTES_LDS"]
-        ].sum(min_count=1)
+        _total_cols = ["TOTAL_OPS", "BYTES_HBM", "BYTES_L2", "BYTES_vL1d", "BYTES_LDS"]
+        _total_cols += [c for c in _precision_ops_cols if c not in _total_cols]
+        _kernel_totals = df_roof.groupby("KernelName")[_total_cols].sum(min_count=1)
 
         aggregate = []
         for index, kernel in df.iterrows():
@@ -3611,6 +3847,7 @@ def extract(
                     "count": int(kernel["Count"]),
                     "color": str(kernel["color"]),
                     "instMix": _compute_inst_mix_payload(kernel, _peaks_agg),
+                    "opsByPrecision": _ops_by_precision(_kt),
                 }
             )
 
@@ -3687,7 +3924,22 @@ def extract(
                 "LDS": _json_safe_float(df_roof["BYTES_LDS"].sum()),
             },
             "runtimeNs": _json_safe_float(_avg_total_ns),
+            "opsByPrecision": _ops_by_precision(df_roof[_precision_ops_cols].sum()),
         }
+
+        _hbm_alpha_map = _load_jkl_alpha_by_label(arch, "hbm") if use_hbm_alpha else {}
+        _lds_alpha_map = _load_jkl_alpha_by_label(arch, "lds") if use_lds_alpha else {}
+        precisions_payload = [
+            {
+                "key": key,
+                "label": label,
+                "peak": _json_safe_float(peak),
+                "hbmAlpha": _json_safe_float(_hbm_alpha_map.get(alpha_label)),
+                "ldsAlpha": _json_safe_float(_lds_alpha_map.get(alpha_label)),
+                "instMixLabels": PRECISION_INST_MIX_LABELS.get(key, []),
+            }
+            for key, label, _, peak, alpha_label in _precisions
+        ]
 
         payload = {
             "meta": {
@@ -3706,6 +3958,8 @@ def extract(
                 "useLdsAlphaModel": use_lds_alpha,
                 "ldsAlphaArch": arch if use_lds_alpha else None,
                 "defaultLdsAlphaFp64Mfma": _json_safe_float(_def_lds_alpha),
+                "arch": arch,
+                "precisions": precisions_payload,
             },
             "kernelComputePeakByName": kernel_compute_peak_by_name,
             "kernelHbmAlphaByName": kernel_hbm_alpha_by_name,
