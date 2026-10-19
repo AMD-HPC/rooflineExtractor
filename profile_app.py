@@ -135,8 +135,9 @@ def build_rocprof_command(run_command, rocprof_args, per_rank_parent=None):
     *inside* the launcher via a small ``bash -c`` wrapper. The wrapper
     derives a per-rank id (falling back to the shell PID) and, if
     ``per_rank_parent`` is given, ``cd``s into ``<per_rank_parent>/rank_<id>``
-    before exec'ing rocprofv3. This ensures rocprofv3's native ``pmc_N/``
-    output layout lands in a unique directory per rank.
+    before exec'ing rocprofv3. This ensures rocprofv3's per-pass output
+    (``pmc_<N>/`` on older ROCm, ``pass_<N>/`` on current ROCm) lands in a
+    unique directory per rank.
 
     Without an MPI launcher, rocprofv3 wraps ``run_command`` directly
     (legacy behavior); ``per_rank_parent`` is ignored.
@@ -362,7 +363,7 @@ def main():
     output_dir = os.path.abspath(output_path)
     
     # Convert input counter file to absolute path (use selected architecture)
-    roof_path = Path(__file__).parent / f'roof-counters-{gfx_arch}.txt'
+    roof_path = Path(__file__).parent / f'roof-counters-{gfx_arch}.yaml'
     counter_input_file = os.path.abspath(roof_path)
     
     # Convert conversion script to absolute path
@@ -398,10 +399,14 @@ def main():
     logger.write("=" * 80)
 
     # Clean up any rocprofv3 output left over from a previous run in the same
-    # output directory. Stale pmc_*/ counter dirs or mpi_counters/mpi_trace
-    # trees would otherwise get mixed with (or block moving in) the new
-    # results. This intentionally leaves logs and other files untouched.
-    stale_entries = sorted(glob.glob(os.path.join(output_dir, 'pmc_*')))
+    # output directory. Stale pmc_*/ or pass_*/ counter dirs, or
+    # mpi_counters/mpi_trace trees, would otherwise get mixed with (or block
+    # moving in) the new results. This intentionally leaves logs and other
+    # files untouched.
+    stale_entries = []
+    for pattern in ('pmc_*', 'pass_*'):
+        stale_entries.extend(glob.glob(os.path.join(output_dir, pattern)))
+    stale_entries = sorted(stale_entries)
     for name in ('mpi_counters', 'mpi_trace'):
         candidate = os.path.join(output_dir, name)
         if os.path.exists(candidate):
@@ -429,7 +434,7 @@ def main():
     # Run rocprofv3 with counter collection
     # Base the message on the number of pmc passes in the selected counter input file
     with open(counter_input_file, 'r', encoding='utf-8') as counter_file:
-        n_runs = sum(1 for line in counter_file if line.strip().startswith('pmc:'))
+        n_runs = sum(1 for line in counter_file if line.strip().startswith('- pmc:'))
     logger.write(f"\n[1/4] Running rocprofv3 with counter collection ({n_runs} runs of the application)...")
 
     counter_rocprof_args_csv = ['-i', counter_input_file, '-o', 'counters', '-f', 'csv']
@@ -454,7 +459,7 @@ def main():
         else:
             logger.write("Counter collection completed successfully")
             if mpi_used:
-                # Move the per-rank parent directory (containing rank_*/pmc_*/...)
+                # Move the per-rank parent directory (containing rank_*/pmc_*/ or rank_*/pass_*/...)
                 if os.path.isdir('mpi_counters'):
                     dest_root = os.path.join(output_dir, 'mpi_counters')
                     logger.write(f"Moving mpi_counters to {dest_root}")
@@ -468,8 +473,12 @@ def main():
                     else:
                         shutil.move('mpi_counters', dest_root)
             else:
-                # Move counter output directories to output_dir
-                for counter_dir in glob.glob('pmc_*'):
+                # Move counter output directories to output_dir. Older ROCm writes
+                # pmc_<N>/; current rocprofv3 writes pass_<N>/.
+                counter_dirs = []
+                for pattern in ('pmc_*', 'pass_*'):
+                    counter_dirs.extend(glob.glob(pattern))
+                for counter_dir in sorted(counter_dirs):
                     logger.write(f"Moving {counter_dir} to {output_dir}")
                     try:
                         shutil.move(counter_dir, output_dir)

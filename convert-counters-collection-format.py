@@ -10,12 +10,16 @@ import argparse
 import logging
 
 
-# rocprofv3 writes per-rank MPI output under ``.../rank_<N>/pmc_*/...`` (see
+# rocprofv3 writes per-rank MPI output under ``.../rank_<N>/<pass>/...`` (see
 # profile_app.py's build_rocprof_command). Detect that rank id from the file
 # path so each rank's counters can be qualified with an ``Application`` column,
 # which keeps otherwise-identical Dispatch_Id values from different ranks from
 # collapsing together downstream.
 _RANK_DIR_RE = re.compile(r"(?:^|/)rank_(\d+)(?:/|$)")
+
+# One directory per counter-collection pass. Older ROCm uses ``pmc_<N>``;
+# current rocprofv3 uses ``pass_<N>``.
+_COUNTER_PASS_DIR_RE = re.compile(r"(?:^|/)(?:pmc|pass)_[^/]+(?:/|$)")
 
 
 def rank_from_path(file_path):
@@ -67,11 +71,12 @@ def read_csv(file_path):
 def get_counter_collection_files(root_path):
     file_paths = []
     for root, _, files in os.walk(root_path):
-        if "pmc_" in root:
-            for file in files:
-                if file.endswith("counter_collection.csv"):
-                    file_path = os.path.join(root, file)
-                    file_paths.append(file_path)
+        normalized = root.replace(os.sep, "/")
+        if not _COUNTER_PASS_DIR_RE.search(normalized):
+            continue
+        for file in files:
+            if file.endswith("counter_collection.csv"):
+                file_paths.append(os.path.join(root, file))
     return file_paths
 
 
