@@ -987,6 +987,8 @@ def compute_flops(df, arch):
     # Concat compute peak columns
     df = pd.concat([df, pd.DataFrame(new_columns, index=df.index)], axis=1)
 
+    df = df.copy()  # de-fragment before adding more columns
+
     if _use_hbm_alpha_model(arch):
         alpha_base = _compute_weighted_hbm_alpha(df, peaks, arch)
         df["HBM_BW_PEAK"] = _exclude_bw_roof_when_no_traffic(
@@ -3370,6 +3372,7 @@ def extract(
             total_by_rank=total_kernels_by_rank,
         )
 
+    df_roof = df_roof.copy()  # de-fragment
     df_roof['Percentage'] = df_roof['DurationNs'] / df_roof['DurationNs'].sum() * 100
 
 
