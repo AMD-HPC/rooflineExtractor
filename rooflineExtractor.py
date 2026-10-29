@@ -1346,7 +1346,7 @@ __D3_SCRIPT__
     <div id="plot-info-popover" class="info-popover" role="region" aria-labelledby="plot-info-heading" hidden>
       <h3 id="plot-info-heading">Implementation Details and Disclaimers</h3>
       <ul>
-        <li><b>Peak compute:</b> The peak compute is based on the instruction mix of each kernel. It is the weighted average of the measured throughput of each instruction counted in the kernel. Clicking on or hovering the mouse over a kernel dot will show that kernel's empirical peak compute. If none is selected, the default peak compute displayed is FP64 MFMA.</li>
+        <li><b>Peak compute:</b> The peak compute is based on the instruction mix of each kernel. It is the weighted average of the measured throughput of each instruction counted in the kernel. Clicking on or hovering the mouse over a kernel dot will show that kernel's empirical peak compute. If none is selected, the default peak compute displayed is the highest empirical peak compute among the kernels currently plotted (or among the dispatches, in the Individual Dispatches view), falling back to FP64 MFMA if none has one. The curved HBM/LDS rooflines use the alpha of that same kernel or dispatch.</li>
         <li><b>Precision:</b> "All (instruction mix)" counts every operation and uses each kernel's instruction-mix peak compute. Choosing a single precision (e.g. FP64 MFMA) counts only that precision's operations in each kernel's total, so arithmetic intensity and throughput change, and uses that precision's empirical peak as the compute roof for every kernel. Kernels with no operations of that precision are hidden. FP64 and FP32 VALU peaks use the MulAdd microbenchmark, FP16 VALU uses the Mul microbenchmark; INT32, INT64, and Other (the "Other VALU" category) use the same peaks as the instruction-mix calculation.</li>
         <li><b>Application-average star:</b> The gold star marks the whole application's aggregate point: arithmetic intensity computed as total FLOPs / total bytes accessed and throughput as total FLOPs / total kernel time, across all dispatches. Its arithmetic intensity follows the currently selected memory region.</li>
         <li><b>Total FLOPs:</b> The "flops" value reported includes floating point AND integer operations. These operations all go through the same VALU pipe, so they should be counted together. </li>
@@ -1633,28 +1633,19 @@ __D3_SCRIPT__
         lines.push("alpha: " + activePrecision.label + " microbenchmark.");
       }
       lines.push(computeRoofFlatDisclaimer());
-    } else if (hbmAlphaOn && cacheKey === "HBM") {
-      if (kernelHbmAlpha() != null) {
-        lines.push("α: instruction-mix weighted (hovered or selected kernel).");
-      } else if (meta.defaultHbmAlphaFp64Mfma != null && Number.isFinite(meta.defaultHbmAlphaFp64Mfma)) {
-        lines.push("α: FP64 MFMA microbenchmark (100% MFMA default).");
-      }
+    } else if (curvedOn) {
+      // hbmAlphaOn/ldsAlphaOn guarantee an alpha: the mix source's own, else the FP64 MFMA default.
+      const r = mixRoof();
+      const mixAlpha = r == null ? null : hbmAlphaOn ? r.hbmAlpha : r.ldsAlpha;
+      lines.push(mixAlpha != null
+        ? "alpha: instruction-mix weighted (" + r.source + ")."
+        : "alpha: FP64 MFMA microbenchmark (100% MFMA default).");
       lines.push(computeRoofFlatDisclaimer());
-    } else if (ldsAlphaOn && cacheKey === "LDS") {
-      if (kernelLdsAlpha() != null) {
-        lines.push("α: instruction-mix weighted (hovered or selected kernel).");
-      } else if (meta.defaultLdsAlphaFp64Mfma != null && Number.isFinite(meta.defaultLdsAlphaFp64Mfma)) {
-        lines.push("α: FP64 MFMA microbenchmark (100% MFMA default).");
-      }
-      lines.push(computeRoofFlatDisclaimer());
-    } else if (roofHoverDispatchComputePeak != null) {
-      lines.push("(Instruction-mix ceiling for hovered dispatch)");
-    } else if (roofHoverKernelName != null) {
-      lines.push("(Instruction-mix ceiling for hovered kernel)");
-    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
-      lines.push("(Instruction-mix ceiling for selected kernel)");
     } else {
-      lines.push("Compute peak is currently drawn according to FP64 MFMA, not kernel-specific instruction mix.");
+      const r = mixRoof();
+      lines.push(r != null
+        ? "(Instruction-mix ceiling for " + r.source + ")"
+        : "Compute peak is currently drawn according to FP64 MFMA, not kernel-specific instruction mix.");
     }
     return lines.join(nl);
   }
@@ -1731,8 +1722,8 @@ __D3_SCRIPT__
   let avgStarSelected = false;
   let avgStarLegendRow = null;
   let roofHoverKernelName = null;
-  /** When Individual (dispatches) view: instruction-mix ceiling for the hovered dispatch (not kernel aggregate). */
-  let roofHoverDispatchComputePeak = null;
+  /** When Individual (dispatches) view: hovered dispatch row, whose own peak and alphas set the roofs. */
+  let roofHoverDispatch = null;
   /** Kernel dispatch row currently showing the dot tooltip (for refresh after curved/linear toggle). */
   let dotTooltipDatum = null;
 
@@ -1744,27 +1735,78 @@ __D3_SCRIPT__
     return selectedRooflineKeys.size > 0;
   }
 
+  function finiteOrNull(v) {
+    return v != null && Number.isFinite(v) ? v : null;
+  }
+
+  /** Roof source from a kernel's aggregate peak and alphas, or null if it has no usable peak. */
+  function kernelMixRoof(name, source) {
+    const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[name];
+    if (!(kp > 0) || !Number.isFinite(kp)) return null;
+    const h = data.kernelHbmAlphaByName && data.kernelHbmAlphaByName[name];
+    const l = data.kernelLdsAlphaByName && data.kernelLdsAlphaByName[name];
+    return {
+      peak: kp,
+      hbmAlpha: h ? finiteOrNull(h.alpha) : null,
+      ldsAlpha: l ? finiteOrNull(l.alpha) : null,
+      source: source,
+    };
+  }
+
+  /** Roof source from a single dispatch's own peak and alphas, or null if it has no usable peak. */
+  function dispatchMixRoof(d, source) {
+    const kp = d.kernelComputePeak;
+    if (!(kp > 0) || !Number.isFinite(kp)) return null;
+    return { peak: kp, hbmAlpha: finiteOrNull(d.hbmAlpha), ldsAlpha: finiteOrNull(d.ldsAlpha), source: source };
+  }
+
+  // Invalidated by redraw(), which runs after every change to what is plotted.
+  let defaultRoofCache;
+  /**
+   * Plotted kernel (Aggregated view) or dispatch (Individual view) with the highest
+   * instruction-mix compute peak; null when none has a usable peak.
+   */
+  function defaultRoof() {
+    if (defaultRoofCache !== undefined) return defaultRoofCache;
+    const agg = currentMode().aggregate;
+    let best = null;
+    computeDotData().forEach(function(d) {
+      const r = agg
+        ? kernelMixRoof(d.kernelName, "plotted kernel with the highest compute peak")
+        : dispatchMixRoof(d, "plotted dispatch with the highest compute peak");
+      if (r != null && (best == null || r.peak > best.peak)) best = r;
+    });
+    defaultRoofCache = best;
+    return best;
+  }
+
+  /**
+   * Instruction-mix source of the flat compute roof and the curved HBM/LDS alphas, in priority
+   * order: hovered dispatch, hovered kernel, single selected kernel (Aggregated view), then
+   * defaultRoof(). Null means fall back to FP64 MFMA. Not used when a precision is chosen.
+   */
+  function mixRoof() {
+    if (roofHoverDispatch != null) {
+      const r = dispatchMixRoof(roofHoverDispatch, "hovered dispatch");
+      if (r != null) return r;
+    }
+    if (roofHoverKernelName != null) {
+      const r = kernelMixRoof(roofHoverKernelName, "hovered kernel");
+      if (r != null) return r;
+    }
+    if (currentMode().aggregate && kernelFilterActive() && selectedKernelNames.size === 1) {
+      const r = kernelMixRoof(Array.from(selectedKernelNames)[0], "selected kernel");
+      if (r != null) return r;
+    }
+    return defaultRoof();
+  }
+
   function effectiveComputePeak() {
     if (activePrecision) {
       return activePrecision.peak;
     }
-    if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
-      return roofHoverDispatchComputePeak;
-    }
-    let cp = meta.computePeak;
-    let mixName = null;
-    if (roofHoverKernelName != null) {
-      mixName = roofHoverKernelName;
-    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
-      mixName = Array.from(selectedKernelNames)[0];
-    }
-    if (mixName != null) {
-      const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[mixName];
-      if (kp != null && Number.isFinite(kp) && kp > 0) {
-        cp = kp;
-      }
-    }
-    return cp;
+    const r = mixRoof();
+    return r != null ? r.peak : meta.computePeak;
   }
 
   /** Matches effectiveComputePeak(): text for the flat compute roof P in tooltips (incl. HBM/LDS α model). */
@@ -1772,57 +1814,11 @@ __D3_SCRIPT__
     if (activePrecision) {
       return "(Compute roof: " + activePrecision.label + " peak for every kernel.)";
     }
-    if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
-      return "(Compute roof: instruction-mix ceiling for hovered dispatch.)";
-    }
-    let mixName = null;
-    if (roofHoverKernelName != null) {
-      mixName = roofHoverKernelName;
-    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
-      mixName = Array.from(selectedKernelNames)[0];
-    }
-    if (mixName != null) {
-      const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[mixName];
-      if (kp != null && Number.isFinite(kp) && kp > 0) {
-        if (roofHoverKernelName != null) {
-          return "(Compute roof: instruction-mix ceiling for hovered kernel.)";
-        }
-        return "(Compute roof: instruction-mix ceiling for selected kernel.)";
-      }
+    const r = mixRoof();
+    if (r != null) {
+      return "(Compute roof: instruction-mix ceiling for " + r.source + ".)";
     }
     return "(Compute roof: FP64 MFMA baseline, or kernel mix when hovered/selected.)";
-  }
-
-  function kernelHbmAlpha() {
-    let mixName = null;
-    if (roofHoverKernelName != null) {
-      mixName = roofHoverKernelName;
-    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
-      mixName = Array.from(selectedKernelNames)[0];
-    }
-    if (mixName != null && data.kernelHbmAlphaByName) {
-      const o = data.kernelHbmAlphaByName[mixName];
-      if (o != null && Number.isFinite(o.alpha)) {
-        return o;
-      }
-    }
-    return null;
-  }
-
-  function kernelLdsAlpha() {
-    let mixName = null;
-    if (roofHoverKernelName != null) {
-      mixName = roofHoverKernelName;
-    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
-      mixName = Array.from(selectedKernelNames)[0];
-    }
-    if (mixName != null && data.kernelLdsAlphaByName) {
-      const o = data.kernelLdsAlphaByName[mixName];
-      if (o != null && Number.isFinite(o.alpha)) {
-        return o;
-      }
-    }
-    return null;
   }
 
   function hbmAlphaForRoofline() {
@@ -1830,9 +1826,9 @@ __D3_SCRIPT__
       const a = activePrecision.hbmAlpha;
       return a != null && Number.isFinite(a) ? { alpha: a } : null;
     }
-    const k = kernelHbmAlpha();
-    if (k != null) {
-      return k;
+    const r = mixRoof();
+    if (r != null && r.hbmAlpha != null) {
+      return { alpha: r.hbmAlpha };
     }
     if (meta.useHbmAlphaModel === true && meta.defaultHbmAlphaFp64Mfma != null && Number.isFinite(meta.defaultHbmAlphaFp64Mfma)) {
       return { alpha: meta.defaultHbmAlphaFp64Mfma };
@@ -1845,9 +1841,9 @@ __D3_SCRIPT__
       const a = activePrecision.ldsAlpha;
       return a != null && Number.isFinite(a) ? { alpha: a } : null;
     }
-    const k = kernelLdsAlpha();
-    if (k != null) {
-      return k;
+    const r = mixRoof();
+    if (r != null && r.ldsAlpha != null) {
+      return { alpha: r.ldsAlpha };
     }
     if (meta.useLdsAlphaModel === true && meta.defaultLdsAlphaFp64Mfma != null && Number.isFinite(meta.defaultLdsAlphaFp64Mfma)) {
       return { alpha: meta.defaultLdsAlphaFp64Mfma };
@@ -2429,17 +2425,7 @@ __D3_SCRIPT__
       // Under "All regions" every dot sits at its own region's AI, so no single row owns the axis.
       text.text(d + (!allRegions && i === r ? " (AI axis)" : ""));
     });
-    let personalTitle = false;
-    if (roofHoverDispatchComputePeak != null && Number.isFinite(roofHoverDispatchComputePeak) && roofHoverDispatchComputePeak > 0) {
-      personalTitle = true;
-    } else if (roofHoverKernelName != null) {
-      const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[roofHoverKernelName];
-      personalTitle = kp != null && Number.isFinite(kp) && kp > 0;
-    } else if (kernelFilterActive() && selectedKernelNames.size === 1) {
-      const n = Array.from(selectedKernelNames)[0];
-      const kp = data.kernelComputePeakByName && data.kernelComputePeakByName[n];
-      personalTitle = kp != null && Number.isFinite(kp) && kp > 0;
-    }
+    const personalTitle = mixRoof() != null;
     legendG.select(".legend-title").text(
       activePrecision ? "Achievable peak (" + activePrecision.label + " roof)"
         : personalTitle ? "Achievable peak (instruction-mix roof)" : "Achievable peak (by memory)"
@@ -2743,18 +2729,14 @@ __D3_SCRIPT__
         event.stopPropagation();
         roofHoverKernelName = null;
         dotTooltipDatum = null;
-        roofHoverDispatchComputePeak = null;
+        roofHoverDispatch = null;
         tooltip.style("display", "none");
         onKernelLegendActivate(event, d.kernelName);
       })
       .on("mouseenter", function(event, d) {
         roofHoverKernelName = d.kernelName;
         dotTooltipDatum = d;
-        if (!currentMode().aggregate && d.kernelComputePeak != null && Number.isFinite(d.kernelComputePeak) && d.kernelComputePeak > 0) {
-          roofHoverDispatchComputePeak = d.kernelComputePeak;
-        } else {
-          roofHoverDispatchComputePeak = null;
-        }
+        roofHoverDispatch = currentMode().aggregate ? null : d;
         refreshRooflinesForDotHover();
         tooltip.style("display", "block").html(tooltipHtml(d));
         moveTooltip(event);
@@ -2765,7 +2747,7 @@ __D3_SCRIPT__
       .on("mouseleave", function() {
         roofHoverKernelName = null;
         dotTooltipDatum = null;
-        roofHoverDispatchComputePeak = null;
+        roofHoverDispatch = null;
         refreshRooflinesForDotHover();
         tooltip.style("display", "none");
       })
@@ -2875,6 +2857,7 @@ __D3_SCRIPT__
   }
 
   function redraw() {
+    defaultRoofCache = undefined;
     const { x, y } = currentScales();
     const lineGen = d3.line()
       .defined(d => d[0] > 0 && d[1] > 0 && isFinite(d[0]) && isFinite(d[1]))
@@ -3197,7 +3180,7 @@ __D3_SCRIPT__
   precSel.addEventListener("change", () => {
     activePrecision = precisions.find(p => p.key === precSel.value) || null;
     roofHoverKernelName = null;
-    roofHoverDispatchComputePeak = null;
+    roofHoverDispatch = null;
     dotTooltipDatum = null;
     tooltip.style("display", "none");
     // Keep the flat roof on screen for precisions whose peak exceeds the default range (e.g. FP8 MFMA).
@@ -3742,6 +3725,11 @@ def extract(
             y_max = 2000000
         else:
             y_max = 500000
+        # The default flat roof is the highest kernel (or dispatch) instruction-mix peak; keep it on screen.
+        _max_kernel_peak = pd.concat([df["KERNEL_COMPUTE_PEAK"], df_plot["KERNEL_COMPUTE_PEAK"]])
+        _max_kernel_peak = pd.to_numeric(_max_kernel_peak, errors="coerce").replace(np.inf, np.nan).max()
+        if pd.notna(_max_kernel_peak):
+            y_max = max(y_max, 2 * float(_max_kernel_peak))
 
         x_vals = np.logspace(np.log10(x_min), np.log10(x_max), 200)
         compute_peak = float(df["COMPUTE_PEAK"].iloc[0])
@@ -3805,6 +3793,8 @@ def extract(
                     "peak": _json_safe_float(row["PEAK"]),
                     "peakLinear": _json_safe_float(row.get("PEAK_LINEAR")),
                     "kernelComputePeak": _json_safe_float(row["KERNEL_COMPUTE_PEAK"]),
+                    "hbmAlpha": _json_safe_float(row.get("HBM_ALPHA")),
+                    "ldsAlpha": _json_safe_float(row.get("LDS_ALPHA")),
                     "limiter": str(row["LIMITER"]),
                     "limiterLinear": str(row["LIMITER_LINEAR"]) if "LIMITER_LINEAR" in row.index else None,
                     "color": str(row["color"]),
